@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Brick Layers",
+  "version": "0.0.1",
+  "description": "A fantasy basketball assistant for drafts, trades, and matchups.",
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
