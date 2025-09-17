@@ -1,17 +1,30 @@
 // content.js
 (() => {
+  // Early log to confirm the script injected at all
+  console.log("[Brick Layers] content.js loaded on:", location.href);
+
   if (!location || !location.hostname) return;
 
-  // Only run on allowed fantasy hosts
+  // Only run on fantasy hosts (include espn.com and sleeper.com variants)
   const allowedHosts = [
     "fantasy.espn.com",
+    "www.espn.com",
+    "espn.com",
     "basketball.fantasysports.yahoo.com",
-    "sleeper.app"
+    "sleeper.app",
+    "www.sleeper.com",
+    "sleeper.com"
   ];
-  if (!allowedHosts.some(h => location.hostname.includes(h))) return;
+  if (!allowedHosts.some(h => location.hostname.includes(h))) {
+    console.log("[Brick Layers] host not allowed:", location.hostname);
+    return;
+  }
 
   // Avoid duplicate injections
-  if (document.getElementById("brick-layers-badge-host")) return;
+  if (document.getElementById("brick-layers-badge-host")) {
+    console.log("[Brick Layers] badge already present; skipping.");
+    return;
+  }
 
   // Log basic context for debugging
   console.log("[Brick Layers] Host:", location.hostname);
@@ -44,9 +57,21 @@
       gap: 8px;
       user-select: none;
     }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #ff6b6b; }
-    .x { margin-left: 8px; opacity: .5; cursor: pointer; font-weight: 600; }
-    .x:hover { opacity: .9; }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ff6b6b;
+    }
+    .x {
+      margin-left: 8px;
+      opacity: .5;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .x:hover {
+      opacity: .9;
+    }
   `;
 
   const wrap = document.createElement("div");
