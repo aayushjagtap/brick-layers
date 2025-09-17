@@ -1,19 +1,37 @@
 // content.js
 (() => {
-  // Only show on real pages (avoid Chrome internal pages)
+  // Don’t run in iframes
+  if (window.top !== window) return;
+
   if (!location || !location.hostname) return;
 
-  // DEV: show everywhere; later we’ll restrict to fantasy sites:
-  // const allowedHosts = ["fantasy.espn.com", "basketball.fantasysports.yahoo.com", "sleeper.app"];
-  // if (!allowedHosts.some(h => location.hostname.includes(h))) return;
+  // DEV LOG: confirm injection
+  console.log("[Brick Layers] injected on:", location.href);
+
+  // Only show badge on fantasy domains (but keep script injected everywhere)
+  const allowedHosts = [
+    "fantasy.espn.com",
+    "espn.com",
+    "www.espn.com",
+    "basketball.fantasysports.yahoo.com",
+    "sports.yahoo.com", // some pages load from here too
+    "sleeper.app",
+    "sleeper.com",
+    "www.sleeper.com"
+  ];
+  const hostOk = allowedHosts.some(h => location.hostname.includes(h));
+  if (!hostOk) {
+    // Stay quiet on non-target sites
+    return;
+  }
 
   // Avoid duplicate injections on SPA navigations
   if (document.getElementById("brick-layers-badge-host")) return;
 
-  // Create a Shadow DOM host so site CSS can’t break our styles
+  // Badge host in shadow to avoid CSS conflicts
   const host = document.createElement("div");
   host.id = "brick-layers-badge-host";
-  host.style.all = "initial"; // isolate just in case
+  host.style.all = "initial";
   host.style.position = "fixed";
   host.style.zIndex = "2147483647";
   host.style.bottom = "16px";
@@ -22,7 +40,6 @@
 
   const shadow = host.attachShadow({ mode: "open" });
 
-  // Badge styles
   const style = document.createElement("style");
   style.textContent = `
     .badge {
@@ -37,26 +54,22 @@
       gap: 8px;
       user-select: none;
     }
-    .dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      background: #ff6b6b; /* brick-ish */
-    }
-    .x {
-      margin-left: 8px;
-      opacity: .5; cursor: pointer; font-weight: 600;
-    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #ff6b6b; }
+    .x { margin-left: 8px; opacity: .5; cursor: pointer; font-weight: 600; }
     .x:hover { opacity: .9; }
   `;
 
   const wrap = document.createElement("div");
   wrap.className = "badge";
-  wrap.innerHTML = `<span class="dot"></span><span>Brick Layers active</span><span class="x">×</span>`;
+  wrap.innerHTML = `
+    <span class="dot"></span>
+    <span>Brick Layers active on ${location.hostname}</span>
+    <span class="x">×</span>
+  `;
 
-  wrap.querySelector(".x").addEventListener("click", () => {
-    host.remove();
-  });
-
+  wrap.querySelector(".x").addEventListener("click", () => host.remove());
   shadow.appendChild(style);
   shadow.appendChild(wrap);
-})();
 
+  console.log("[Brick Layers] badge injected on:", location.hostname);
+})();
