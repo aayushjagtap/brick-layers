@@ -1,40 +1,19 @@
 // content.js
 (() => {
-  // Early log to confirm the script injected at all
-  console.log("[Brick Layers] content.js loaded on:", location.href);
-
+  // Only show on real pages (avoid Chrome internal pages)
   if (!location || !location.hostname) return;
 
-  // Only run on fantasy hosts (include espn.com and sleeper.com variants)
-  const allowedHosts = [
-    "fantasy.espn.com",
-    "www.espn.com",
-    "espn.com",
-    "basketball.fantasysports.yahoo.com",
-    "sleeper.app",
-    "www.sleeper.com",
-    "sleeper.com"
-  ];
-  if (!allowedHosts.some(h => location.hostname.includes(h))) {
-    console.log("[Brick Layers] host not allowed:", location.hostname);
-    return;
-  }
+  // DEV: show everywhere; later we’ll restrict to fantasy sites:
+  // const allowedHosts = ["fantasy.espn.com", "basketball.fantasysports.yahoo.com", "sleeper.app"];
+  // if (!allowedHosts.some(h => location.hostname.includes(h))) return;
 
-  // Avoid duplicate injections
-  if (document.getElementById("brick-layers-badge-host")) {
-    console.log("[Brick Layers] badge already present; skipping.");
-    return;
-  }
+  // Avoid duplicate injections on SPA navigations
+  if (document.getElementById("brick-layers-badge-host")) return;
 
-  // Log basic context for debugging
-  console.log("[Brick Layers] Host:", location.hostname);
-  console.log("[Brick Layers] Path:", location.pathname);
-  console.log("[Brick Layers] Title:", document.title);
-
-  // --- Badge UI ---
+  // Create a Shadow DOM host so site CSS can’t break our styles
   const host = document.createElement("div");
   host.id = "brick-layers-badge-host";
-  host.style.all = "initial";
+  host.style.all = "initial"; // isolate just in case
   host.style.position = "fixed";
   host.style.zIndex = "2147483647";
   host.style.bottom = "16px";
@@ -43,6 +22,7 @@
 
   const shadow = host.attachShadow({ mode: "open" });
 
+  // Badge styles
   const style = document.createElement("style");
   style.textContent = `
     .badge {
@@ -58,31 +38,25 @@
       user-select: none;
     }
     .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #ff6b6b;
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #ff6b6b; /* brick-ish */
     }
     .x {
       margin-left: 8px;
-      opacity: .5;
-      cursor: pointer;
-      font-weight: 600;
+      opacity: .5; cursor: pointer; font-weight: 600;
     }
-    .x:hover {
-      opacity: .9;
-    }
+    .x:hover { opacity: .9; }
   `;
 
   const wrap = document.createElement("div");
   wrap.className = "badge";
-  wrap.innerHTML = `
-    <span class="dot"></span>
-    <span>Brick Layers active on ${location.hostname}</span>
-    <span class="x">×</span>
-  `;
+  wrap.innerHTML = `<span class="dot"></span><span>Brick Layers active</span><span class="x">×</span>`;
 
-  wrap.querySelector(".x").addEventListener("click", () => host.remove());
+  wrap.querySelector(".x").addEventListener("click", () => {
+    host.remove();
+  });
+
   shadow.appendChild(style);
   shadow.appendChild(wrap);
 })();
+
