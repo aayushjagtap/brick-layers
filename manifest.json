@@ -18,14 +18,7 @@
   },
   "content_scripts": [
     {
-      "matches": [
-        "*://fantasy.espn.com/*",
-        "*://espn.com/fantasy/*",
-        "*://www.espn.com/fantasy/*",
-        "*://basketball.fantasysports.yahoo.com/*",
-        "*://sleeper.app/*",
-        "*://sleeper.com/*"
-      ],
+      "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
