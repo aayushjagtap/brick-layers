@@ -20,11 +20,15 @@
     {
       "matches": [
         "*://fantasy.espn.com/*",
+        "*://espn.com/fantasy/*",
+        "*://www.espn.com/fantasy/*",
         "*://basketball.fantasysports.yahoo.com/*",
-        "*://sleeper.app/*"
+        "*://sleeper.app/*",
+        "*://sleeper.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
   ]
 }
+
