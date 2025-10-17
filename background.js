@@ -1,81 +1,181 @@
-// background.js (MV3 service worker, ESM-friendly)
+// background.js (Step 2: data layer scaffolding, MV3 service worker)
 
-// Simple in-memory cache for projections/schedules
+// ---------- Config ----------
+const STORAGE_KEY = "BL_STATE_V1";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const state = {
-  projections: {},
-  schedules: {},
-  lastFetch: 0
-};
 
-// Listen for messages from content scripts / popup / sidebar
+// ---------- State helpers ----------
+async function getState() {
+  const { [STORAGE_KEY]: s } = await chrome.storage.local.get(STORAGE_KEY);
+  return s || defaultState();
+}
+
+async function setState(next) {
+  await chrome.storage.local.set({ [STORAGE_KEY]: next });
+}
+
+function defaultState() {
+  return {
+    leagues: {},        // [leagueId]: { platform, settings, teams, roster }
+    projections: {},    // [season]: { [playerId]: { name, team, pos: [], cats: {...} } }
+    schedules: {},      // [dateISO]: { [teamAbbr]: { opp, homeAway, b2b } }
+    meta: { updatedAt: 0, lastFetch: 0 }
+  };
+}
+
+// ---------- Demo data (replace with real feeds later) ----------
+function sampleProjections() {
+  return {
+    "2025": {
+      lebron_james: {
+        name: "LeBron James",
+        team: "LAL",
+        pos: ["SF", "PF"],
+        cats: {
+          pts: 25.3, reb: 7.8, ast: 7.2, stl: 1.1, blk: 0.6,
+          "3pm": 2.2, fg_pct: 0.52, ft_pct: 0.73, to: 3.4
+        }
+      },
+      stephen_curry: {
+        name: "Stephen Curry",
+        team: "GSW",
+        pos: ["PG"],
+        cats: {
+          pts: 28.1, reb: 4.4, ast: 6.3, stl: 0.9, blk: 0.2,
+          "3pm": 4.7, fg_pct: 0.47, ft_pct: 0.91, to: 3.2
+        }
+      },
+      anthony_davis: {
+        name: "Anthony Davis",
+        team: "DAL", // ✅ corrected per your note
+        pos: ["PF", "C"],
+        cats: {
+          pts: 24.7, reb: 12.1, ast: 3.5, stl: 1.2, blk: 2.3,
+          "3pm": 0.4, fg_pct: 0.57, ft_pct: 0.79, to: 2.1
+        }
+      }
+    }
+  };
+}
+
+function sampleSchedules() {
+  // ✅ Updated to your Oct 21–22 screenshots
+  return {
+    "2025-10-21": {
+      HOU: { opp: "OKC", homeAway: "away", b2b: false },
+      OKC: { opp: "HOU", homeAway: "home", b2b: false },
+      GSW: { opp: "LAL", homeAway: "home", b2b: false },
+      LAL: { opp: "GSW", homeAway: "away", b2b: false }
+    },
+    "2025-10-22": {
+      CLE: { opp: "NYK", homeAway: "home", b2b: false },
+      NYK: { opp: "CLE", homeAway: "away", b2b: false },
+      MIA: { opp: "ORL", homeAway: "away", b2b: false },
+      ORL: { opp: "MIA", homeAway: "home", b2b: false },
+      BKN: { opp: "CHA", homeAway: "away", b2b: false },
+      CHA: { opp: "BKN", homeAway: "home", b2b: false },
+      TOR: { opp: "ATL", homeAway: "away", b2b: false },
+      ATL: { opp: "TOR", homeAway: "home", b2b: false },
+      PHI: { opp: "BOS", homeAway: "away", b2b: false },
+      BOS: { opp: "PHI", homeAway: "home", b2b: false },
+      NOP: { opp: "MEM", homeAway: "away", b2b: false },
+      MEM: { opp: "NOP", homeAway: "home", b2b: false },
+      DET: { opp: "CHI", homeAway: "home", b2b: false },
+      CHI: { opp: "DET", homeAway: "away", b2b: false },
+      WAS: { opp: "MIL", homeAway: "away", b2b: false },
+      MIL: { opp: "WAS", homeAway: "home", b2b: false },
+      LAC: { opp: "UTA", homeAway: "home", b2b: false },
+      UTA: { opp: "LAC", homeAway: "away", b2b: false },
+      MIN: { opp: "POR", homeAway: "home", b2b: false },
+      POR: { opp: "MIN", homeAway: "away", b2b: false },
+      SAC: { opp: "PHX", homeAway: "home", b2b: false },
+      PHX: { opp: "SAC", homeAway: "away", b2b: false },
+      DAL: { opp: "SAS", homeAway: "home", b2b: false },
+      SAS: { opp: "DAL", homeAway: "away", b2b: false }
+    }
+  };
+}
+
+// ---------- Fetch/ensure ----------
+async function ensureData() {
+  const s = await getState();
+  const now = Date.now();
+  if (now - (s.meta.lastFetch || 0) < CACHE_TTL_MS) return s;
+
+  // Step 2: seed with local demo data (to be replaced with real feeds later)
+  s.projections = sampleProjections();
+  s.schedules = sampleSchedules();
+  s.meta.lastFetch = now;
+  s.meta.updatedAt = now;
+
+  await setState(s);
+  console.log("[Brick Layers][background] demo data loaded", {
+    projectionsCount: Object.keys(s.projections?.["2025"] || {}).length,
+    daysWithSchedules: Object.keys(s.schedules || {}).length
+  });
+  return s;
+}
+
+// ---------- Message API ----------
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
-      if (msg?.type === "GET_NORMALIZED_DATA") {
-        await ensureData();
-        sendResponse({
-          ok: true,
-          data: {
-            projections: state.projections,
-            schedules: state.schedules
-          }
-        });
-      } else if (msg?.type === "PING") {
-        sendResponse({ ok: true, pong: true, ts: Date.now() });
+      switch (msg?.type) {
+        case "PING": {
+          sendResponse({ ok: true, pong: true, ts: Date.now() });
+          break;
+        }
+
+        case "GET_DATA": {
+          const s = await ensureData();
+          sendResponse({
+            ok: true,
+            data: {
+              projections: s.projections,
+              schedules: s.schedules,
+              meta: s.meta
+            }
+          });
+          break;
+        }
+
+        case "GET_LEAGUE_SETTINGS": {
+          const s = await getState();
+          const league = s.leagues?.[msg.leagueId] || null;
+          sendResponse({ ok: true, league });
+          break;
+        }
+
+        case "UPSERT_LEAGUE_SETTINGS": {
+          const s = await getState();
+          s.leagues = s.leagues || {};
+          s.leagues[msg.leagueId] = {
+            ...(s.leagues[msg.leagueId] || {}),
+            platform: msg.platform ?? s.leagues[msg.leagueId]?.platform ?? null,
+            settings: {
+              ...(s.leagues[msg.leagueId]?.settings || {}),
+              ...(msg.settings || {})
+            }
+          };
+          s.meta.updatedAt = Date.now();
+          await setState(s);
+          sendResponse({ ok: true, league: s.leagues[msg.leagueId] });
+          break;
+        }
+
+        case "CLEAR_DATA": {
+          await setState(defaultState());
+          sendResponse({ ok: true });
+          break;
+        }
+
+        default:
+          sendResponse({ ok: false, error: "unknown_message_type" });
       }
     } catch (err) {
       console.error("[Brick Layers][background] error:", err);
       sendResponse({ ok: false, error: String(err) });
     }
   })();
-  return true; // keep the channel open for async responses
+  return true; // async responses
 });
-
-// Ensure our cache is populated/fresh
-async function ensureData() {
-  const now = Date.now();
-  if (now - state.lastFetch < CACHE_TTL_MS) return;
-
-  // In Step 1, we stub these out. In later steps, wire to your feeds.
-  state.projections = await loadProjections();
-  state.schedules = await loadSchedules();
-  state.lastFetch = now;
-
-  console.log("[Brick Layers][background] data refreshed", {
-    projectionsCount: Object.keys(state.projections || {}).length,
-    schedulesCount: Object.keys(state.schedules || {}).length
-  });
-}
-
-// TODO: Replace with real projection sources (static JSON or remote)
-async function loadProjections() {
-  // Example shape (for later steps):
-  // return {
-  //   "2025": {
-  //     "playerId_123": {
-  //       name: "Player A",
-  //       team: "LAL",
-  //       pos: ["SG", "SF"],
-  //       cats: { pts: 24.5, reb: 6.1, ast: 4.3, stl: 1.3, blk: 0.6, "3pm": 2.7, fg_pct: 0.475, ft_pct: 0.85, to: 2.3 }
-  //     }
-  //   }
-  // };
-  return {}; // stub for step 1
-}
-
-// TODO: Replace with real NBA schedule feed
-async function loadSchedules() {
-  // Example shape (for later steps):
-  // return {
-  //   "2025-10-20": { LAL: { opp: "GSW", homeAway: "home", b2b: false }, GSW: {...} },
-  //   "2025-10-21": { ... }
-  // };
-  return {}; // stub for step 1
-}
-
-// Optional: simple alarm to refresh cache on a cadence (disabled for now)
-// chrome.alarms.create("refreshData", { periodInMinutes: 60 });
-// chrome.alarms.onAlarm.addListener(async alarm => {
-//   if (alarm.name === "refreshData") await ensureData();
-// });

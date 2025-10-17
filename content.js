@@ -1,13 +1,12 @@
-// content.js
+// content.js — Step 2
 (() => {
   // Don’t run in iframes
   if (window.top !== window) return;
   if (!location || !location.hostname) return;
 
-  // DEV: confirm injection
   console.log("[Brick Layers] injected on:", location.href);
 
-  // Fantasy domains where we show the badge/UI (script still injects everywhere for now)
+  // Limit to fantasy basketball hosts
   const allowedHosts = new Set([
     "fantasy.espn.com",
     "espn.com",
@@ -18,28 +17,46 @@
     "sleeper.app",
     "www.sleeper.app"
   ]);
-
   const isFantasyHost = [...allowedHosts].some(h => location.hostname.endsWith(h));
   if (!isFantasyHost) return;
 
-  // Ask background for (stub) normalized data — verifies messaging path.
-  chrome.runtime.sendMessage({ type: "GET_NORMALIZED_DATA" }, (resp) => {
-    if (!resp) {
-      console.warn("[Brick Layers] no response from background (check service worker)");
-      return;
-    }
-    if (!resp.ok) {
-      console.warn("[Brick Layers] background error:", resp.error);
-      return;
-    }
-    console.debug("[Brick Layers] background data:", resp.data);
-  });
-
-  // Avoid duplicate badge injection
+  // Prevent duplicate injection
   const HOST_ID = "brick-layers-host";
   if (document.getElementById(HOST_ID)) return;
 
-  // Host element with Shadow DOM to isolate styles
+  // Ask background for stored data
+  chrome.runtime.sendMessage({ type: "GET_DATA" }, (resp) => {
+    if (!resp?.ok) {
+      console.warn("[Brick Layers] GET_DATA failed:", resp?.error);
+      return;
+    }
+    const { projections, schedules, meta } = resp.data || {};
+    const season = Object.keys(projections || {})[0];
+    const players = Object.keys((projections || {})[season] || {});
+    const days = Object.keys(schedules || {});
+    console.debug("[Brick Layers] data summary:", {
+      season,
+      playersCount: players.length,
+      daysWithSchedules: days.length,
+      updatedAt: new Date(meta?.updatedAt || 0).toLocaleString()
+    });
+  });
+
+  // Add a demo league to storage
+  chrome.runtime.sendMessage({
+    type: "UPSERT_LEAGUE_SETTINGS",
+    leagueId: "demo-league-1",
+    platform: "espn",
+    settings: {
+      scoring: "H2H",
+      categories: ["pts", "reb", "ast", "stl", "blk", "3pm", "fg_pct", "ft_pct", "to"],
+      playoffWeeks: ["2025-03-31", "2025-04-07", "2025-04-14"]
+    }
+  }, (resp) => {
+    if (resp?.ok) console.debug("[Brick Layers] league saved:", resp.league);
+  });
+
+  // ---------- Badge injection ----------
   const host = document.createElement("div");
   host.id = HOST_ID;
   host.style.position = "fixed";
@@ -48,12 +65,11 @@
   host.style.right = "16px";
   host.style.width = "auto";
   host.style.height = "auto";
-  host.style.pointerEvents = "none"; // allow clicks to pass unless on our badge
+  host.style.pointerEvents = "none";
   document.documentElement.appendChild(host);
 
   const shadow = host.attachShadow({ mode: "open" });
 
-  // Styles for the small badge
   const style = document.createElement("style");
   style.textContent = `
     .badge {
@@ -73,9 +89,8 @@
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #22c55e; /* green */
+      background: #22c55e;
       box-shadow: 0 0 0 3px rgba(34,197,94,.25);
-      display: inline-block;
     }
     .x {
       display: inline-block;
@@ -98,7 +113,6 @@
     .btn:hover { background: #0b1220; }
   `;
 
-  // Badge UI
   const wrap = document.createElement("div");
   wrap.className = "badge";
   wrap.innerHTML = `
@@ -108,20 +122,17 @@
     <span class="x" title="Hide">×</span>
   `;
 
-  // Close button
   wrap.querySelector(".x").addEventListener("click", () => {
     host.remove();
     console.log("[Brick Layers] badge removed by user");
   });
 
-  // Ping button (tests roundtrip messaging)
   wrap.querySelector("#ping").addEventListener("click", () => {
     chrome.runtime.sendMessage({ type: "PING" }, (resp) => {
-      if (resp?.ok) {
+      if (resp?.ok)
         console.log("[Brick Layers] PONG from background:", new Date(resp.ts).toLocaleString());
-      } else {
+      else
         console.warn("[Brick Layers] Ping failed:", resp?.error);
-      }
     });
   });
 
