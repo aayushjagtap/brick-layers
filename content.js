@@ -1,6 +1,7 @@
-// content.js — Draft module via real import + tabbed sidebar (Roster / Draft / Upcoming)
+// content.js — Tabbed sidebar (Roster / Draft / Upcoming) + Draft engine import + ESPN context & roster
 
 (() => {
+  // Don’t run in iframes or on non-target hosts
   if (window.top !== window) return;
   if (!location || !location.hostname) return;
   console.log("[Brick Layers] injected on:", location.href);
@@ -13,6 +14,7 @@
   const isFantasyHost = [...allowedHosts].some(h => location.hostname.endsWith(h));
   if (!isFantasyHost) return;
 
+  // Prevent duplicate injection
   const HOST_ID = "brick-layers-host";
   if (document.getElementById(HOST_ID)) return;
 
@@ -248,50 +250,142 @@
       });
     }
 
+    // ---------- Draft tab (needs-based + sliders + owned filter) ----------
     function renderDraft() {
       if (!DraftCore) {
         body.innerHTML = `<div class="sub">Loading draft engine…</div>`;
         setTimeout(renderDraft, 150);
         return;
       }
+
       getData(({ projections }) => {
         const season = Object.keys(projections || {})[0];
         const players = (projections || {})[season] || {};
         const cats = ["pts","reb","ast","stl","blk","3pm","fg_pct","ft_pct","to"];
-        const weights = { pts:1, reb:1, ast:1, stl:1, blk:1, "3pm":1, fg_pct:1, ft_pct:1, to:1 };
 
+        body.innerHTML = "";
+
+        // Controls row
         const controls = document.createElement("div");
         controls.className = "row";
+        controls.style.flexWrap = "wrap";
         controls.innerHTML = `
           <label class="sub">Filter pos:</label>
           <select id="posf">
             <option value="">All</option>
             <option>PG</option><option>SG</option><option>SF</option><option>PF</option><option>C</option>
           </select>
+          <label class="sub" style="margin-left:8px;">
+            <input type="checkbox" id="useNeeds" checked style="vertical-align:middle; margin-right:4px;"> Use team needs
+          </label>
         `;
-        body.innerHTML = "";
         body.appendChild(controls);
+
+        // Category sliders
+        const weightsWrap = document.createElement("div");
+        weightsWrap.className = "row";
+        weightsWrap.style.flexWrap = "wrap";
+        weightsWrap.style.gap = "8px";
+        weightsWrap.style.margin = "6px 0 4px 0";
+        weightsWrap.innerHTML = cats.map(c => `
+          <div style="display:flex;align-items:center;gap:6px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:4px 6px;">
+            <label class="sub" style="min-width:46px;text-transform:uppercase;">${c}</label>
+            <input type="range" min="0" max="200" value="100" data-cat="${c}">
+            <span class="sub num" data-lab="${c}">1.00</span>
+          </div>
+        `).join("");
+        body.appendChild(weightsWrap);
+
         const listWrap = document.createElement("div");
         body.appendChild(listWrap);
 
-        const renderList = () => {
-          const pos = controls.querySelector("#posf").value;
-          const top = DraftCore.bestAvailable(players, cats, weights, { pos: pos ? [pos] : [] }).slice(0, 10);
-          listWrap.innerHTML = `
-            <ul>
-              ${top.map(item => {
-                const p = item.player;
-                return `<li>
-                  <span>${p.name}</span>
-                  <span class="sub">${(p.team||"")} ${(p.pos||[]).join("/")}</span>
-                  <span class="num">${item.dv.toFixed(2)}</span>
-                </li>`;
-              }).join("")}
-            </ul>`;
-        };
+        // Pull roster from storage to compute needs & exclude owned
+        const params = new URLSearchParams(location.search);
+        const leagueId = params.get("leagueId");
+        chrome.runtime.sendMessage({ type: "GET_LEAGUE_SETTINGS", leagueId }, (resp) => {
+          const roster = resp?.league?.roster || [];
 
-        controls.querySelector("#posf").addEventListener("change", renderList);
-        renderList();
+          // Default & needs weights
+          let baseWeights = Object.fromEntries(cats.map(c => [c, 1]));
+          let needsWeights = baseWeights;
+
+          if (roster.length) {
+            const { matched } = DraftCore.mapRosterToProjections(roster, players);
+            if (matched.length) {
+              const { teamZ } = DraftCore.teamZFromRoster(matched, players, cats);
+              needsWeights = DraftCore.weightsFromNeeds(teamZ);
+            }
+          }
+
+          // UI state
+          const state = {
+            pos: "",
+            useNeeds: true,
+            manualWeights: { ...baseWeights },
+          };
+
+          // Initialize slider labels
+          for (const c of cats) {
+            const lab = weightsWrap.querySelector(`[data-lab="${c}"]`);
+            lab.textContent = state.manualWeights[c].toFixed(2);
+            const slider = weightsWrap.querySelector(`input[data-cat="${c}"]`);
+            slider.value = String(Math.round(state.manualWeights[c] * 100));
+          }
+
+          // Wire controls
+          controls.querySelector("#posf").addEventListener("change", (e) => {
+            state.pos = e.target.value || "";
+            renderList();
+          });
+          controls.querySelector("#useNeeds").addEventListener("change", (e) => {
+            state.useNeeds = !!e.target.checked;
+            renderList();
+          });
+          weightsWrap.querySelectorAll('input[type="range"]').forEach(sl => {
+            sl.addEventListener("input", () => {
+              const cat = sl.dataset.cat;
+              const v = Math.max(0, Number(sl.value) || 100) / 100;
+              state.manualWeights[cat] = v;
+              const lab = weightsWrap.querySelector(`[data-lab="${cat}"]`);
+              lab.textContent = v.toFixed(2);
+              renderList();
+            });
+          });
+
+          renderList();
+
+          function effectiveWeights() {
+            // needs (0.5..1.5) × manual slider (0..2)
+            const w = {};
+            for (const c of cats) {
+              const needs = state.useNeeds ? (needsWeights[c] ?? 1) : 1;
+              w[c] = needs * (state.manualWeights[c] ?? 1);
+            }
+            return w;
+          }
+
+          function renderList() {
+            const weights = effectiveWeights();
+            const ownedNames = roster.map(r => r.name);
+            const top = DraftCore.bestAvailable(players, cats, weights, {
+              pos: state.pos ? [state.pos] : [],
+              ownedNames
+            }).slice(0, 15);
+
+            listWrap.innerHTML = `
+              <ul>
+                ${top.map(item => {
+                  const p = item.player;
+                  return `<li>
+                    <span>${p.name}</span>
+                    <span class="sub">${(p.team||"")} ${(p.pos||[]).join("/")}</span>
+                    <span class="num">${item.dv.toFixed(2)}</span>
+                  </li>`;
+                }).join("")}
+              </ul>
+            `;
+          }
+        });
       });
     }
   }
