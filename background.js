@@ -1,4 +1,4 @@
-// background.js (Step 2: data layer scaffolding, MV3 service worker)
+// background.js (Step 3: data layer + ESPN context handler)
 
 // ---------- Config ----------
 const STORAGE_KEY = "BL_STATE_V1";
@@ -16,7 +16,7 @@ async function setState(next) {
 
 function defaultState() {
   return {
-    leagues: {},        // [leagueId]: { platform, settings, teams, roster }
+    leagues: {},        // [leagueId]: { platform, settings, context, teams, roster }
     projections: {},    // [season]: { [playerId]: { name, team, pos: [], cats: {...} } }
     schedules: {},      // [dateISO]: { [teamAbbr]: { opp, homeAway, b2b } }
     meta: { updatedAt: 0, lastFetch: 0 }
@@ -47,7 +47,7 @@ function sampleProjections() {
       },
       anthony_davis: {
         name: "Anthony Davis",
-        team: "DAL", // ✅ corrected per your note
+        team: "DAL",
         pos: ["PF", "C"],
         cats: {
           pts: 24.7, reb: 12.1, ast: 3.5, stl: 1.2, blk: 2.3,
@@ -59,7 +59,6 @@ function sampleProjections() {
 }
 
 function sampleSchedules() {
-  // ✅ Updated to your Oct 21–22 screenshots
   return {
     "2025-10-21": {
       HOU: { opp: "OKC", homeAway: "away", b2b: false },
@@ -102,7 +101,6 @@ async function ensureData() {
   const now = Date.now();
   if (now - (s.meta.lastFetch || 0) < CACHE_TTL_MS) return s;
 
-  // Step 2: seed with local demo data (to be replaced with real feeds later)
   s.projections = sampleProjections();
   s.schedules = sampleSchedules();
   s.meta.lastFetch = now;
@@ -160,6 +158,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           s.meta.updatedAt = Date.now();
           await setState(s);
           sendResponse({ ok: true, league: s.leagues[msg.leagueId] });
+          break;
+        }
+
+        // NEW in Step 3: persist ESPN context from adapter
+        case "UPSERT_LEAGUE_CONTEXT": {
+          const s = await getState();
+          const { leagueId, platform, context } = msg;
+          if (!leagueId) {
+            sendResponse({ ok: false, error: "missing_leagueId" });
+            break;
+          }
+          s.leagues = s.leagues || {};
+          const prev = s.leagues[leagueId] || {};
+          s.leagues[leagueId] = {
+            ...prev,
+            platform: platform ?? prev.platform ?? "espn",
+            context: {
+              ...(prev.context || {}),
+              ...(context || {}) // e.g., { teamId, seasonId, teamName }
+            }
+          };
+          s.meta.updatedAt = Date.now();
+          await setState(s);
+          sendResponse({ ok: true, league: s.leagues[leagueId] });
           break;
         }
 

@@ -1,12 +1,10 @@
-// content.js — Step 2
+// content.js — Step 3
 (() => {
-  // Don’t run in iframes
   if (window.top !== window) return;
   if (!location || !location.hostname) return;
 
   console.log("[Brick Layers] injected on:", location.href);
 
-  // Limit to fantasy basketball hosts
   const allowedHosts = new Set([
     "fantasy.espn.com",
     "espn.com",
@@ -20,9 +18,42 @@
   const isFantasyHost = [...allowedHosts].some(h => location.hostname.endsWith(h));
   if (!isFantasyHost) return;
 
-  // Prevent duplicate injection
   const HOST_ID = "brick-layers-host";
   if (document.getElementById(HOST_ID)) return;
+
+  // --- NEW: detect ESPN context and save it ---
+  (async () => {
+    try {
+      if (window.BLAdapters?.espn) {
+        const ctx = await window.BLAdapters.espn.detectContext();
+        if (ctx?.leagueId) {
+          chrome.runtime.sendMessage({
+            type: "UPSERT_LEAGUE_CONTEXT",
+            leagueId: ctx.leagueId,
+            platform: "espn",
+            context: {
+              teamId: ctx.teamId,
+              seasonId: ctx.seasonId,
+              teamName: ctx.teamName
+            }
+          }, (resp) => {
+            if (resp?.ok) {
+              console.log("[Brick Layers] ESPN context saved:", {
+                leagueId: ctx.leagueId,
+                teamId: ctx.teamId,
+                seasonId: ctx.seasonId,
+                teamName: ctx.teamName
+              });
+            } else {
+              console.warn("[Brick Layers] save context failed:", resp?.error);
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("[Brick Layers] ESPN detect failed:", e);
+    }
+  })();
 
   // Ask background for stored data
   chrome.runtime.sendMessage({ type: "GET_DATA" }, (resp) => {
@@ -34,7 +65,7 @@
     const season = Object.keys(projections || {})[0];
     const players = Object.keys((projections || {})[season] || {});
     const days = Object.keys(schedules || {});
-    console.debug("[Brick Layers] data summary:", {
+    console.log("[Brick Layers] data summary:", {
       season,
       playersCount: players.length,
       daysWithSchedules: days.length,
@@ -42,7 +73,7 @@
     });
   });
 
-  // Add a demo league to storage
+  // Optional demo league entry (kept from Step 2)
   chrome.runtime.sendMessage({
     type: "UPSERT_LEAGUE_SETTINGS",
     leagueId: "demo-league-1",
@@ -53,10 +84,10 @@
       playoffWeeks: ["2025-03-31", "2025-04-07", "2025-04-14"]
     }
   }, (resp) => {
-    if (resp?.ok) console.debug("[Brick Layers] league saved:", resp.league);
+    if (resp?.ok) console.log("[Brick Layers] league saved:", resp.league);
   });
 
-  // ---------- Badge injection ----------
+  // ---------- Badge ----------
   const host = document.createElement("div");
   host.id = HOST_ID;
   host.style.position = "fixed";

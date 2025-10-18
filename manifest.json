@@ -43,9 +43,16 @@
 
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_end",
+      "matches": [
+        "*://fantasy.espn.com/*",
+        "*://*.espn.com/*",
+        "*://basketball.fantasysports.yahoo.com/*",
+        "*://sports.yahoo.com/*",
+        "*://sleeper.app/*",
+        "*://*.sleeper.com/*"
+      ],
+      "js": ["adapters/espn.js", "content.js"],
+      "run_at": "document_idle",
       "all_frames": false
     }
   ]
