@@ -1,5 +1,5 @@
 // adapters/espn.js
-// ESPN context + roster extraction
+// ESPN context + roster extraction (new + legacy DOMs).
 // Exposes: window.BLAdapters.espn.detectContext(), window.BLAdapters.espn.getRoster()
 
 (function () {
@@ -9,15 +9,6 @@
 
   // ---------- utils ----------
   const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-  const isGeneric = (s) => {
-    if (!s) return true;
-    const t = s.toLowerCase();
-    if (t.includes("fantasy basketball team clubhouse")) return true;
-    if (t === "fantasy basketball") return true;
-    if (t === "clubhouse") return true;
-    if (t.replace(/[^\w]/g, "").length < 3) return true;
-    return false;
-  };
 
   function getParamsFromURL() {
     try {
@@ -58,11 +49,21 @@
     });
   }
 
-  // ---------- team name strategies ----------
+  // ---------- team name helpers ----------
+  const isGenericTeam = (t) => {
+    if (!t) return true;
+    const s = t.toLowerCase();
+    if (s.includes("fantasy basketball team clubhouse")) return true;
+    if (s === "fantasy basketball") return true;
+    if (s === "clubhouse") return true;
+    if (s.replace(/[^\w]/g, "").length < 3) return true;
+    return false;
+  };
+
   function teamNameFromHeader() {
     const selectors = [
-      '.ClubhouseHeader__TeamName',
       '[data-testid="teamHeaderTeamName"]',
+      '.ClubhouseHeader__TeamName',
       '[data-testid="clubhouse-header"] h1',
       '[data-testid="page-title"]',
       'header h1',
@@ -72,7 +73,7 @@
     for (const sel of selectors) {
       const el = document.querySelector(sel);
       const txt = clean(el?.textContent || "");
-      if (txt && !isGeneric(txt)) return txt;
+      if (txt && !isGenericTeam(txt)) return txt;
     }
     return null;
   }
@@ -80,14 +81,13 @@
   function teamNameFromMeta() {
     const metas = [
       document.querySelector('meta[property="og:title"]')?.content,
-      document.querySelector('meta[name="twitter:title"]')?.content
+      document.querySelector('meta[name="twitter:title"]')?.content,
     ].filter(Boolean);
-
     for (const m of metas) {
       const txt = clean(m);
       if (!txt) continue;
       const candidate = clean(txt.split(" - ")[0]);
-      if (candidate && !isGeneric(candidate)) return candidate;
+      if (candidate && !isGenericTeam(candidate)) return candidate;
     }
     return null;
   }
@@ -102,7 +102,7 @@
       return h.includes(`leagueId=${leagueId}`) && h.includes(`teamId=${teamId}`);
     });
     const txt = clean(cand?.textContent || "");
-    return txt && !isGeneric(txt) ? txt : null;
+    return txt && !isGenericTeam(txt) ? txt : null;
   }
 
   function teamNameFromGenericHeadings() {
@@ -111,7 +111,7 @@
     )
       .map(el => clean(el.textContent))
       .filter(Boolean)
-      .filter(t => !isGeneric(t))
+      .filter(t => !isGenericTeam(t))
       .filter(t => t.length >= 4);
     if (cands.length) return cands.sort((a, b) => b.length - a.length)[0];
     return null;
@@ -131,13 +131,16 @@
 
     await waitForAny(
       [
-        '.ClubhouseHeader__TeamName',
         '[data-testid="teamHeaderTeamName"]',
+        '.ClubhouseHeader__TeamName',
         '[data-testid="clubhouse-header"]',
         'main h1',
         'header h1',
+        // roster bits we also wait for
+        '[data-testid="rosterSlot"]',
         '[data-testid="rosterTable"]',
-        '.Table__TBODY'
+        '.Table__TBODY',
+        'table tbody'
       ],
       3000
     );
@@ -159,54 +162,95 @@
   }
 
   // ---------- public: get roster ----------
-  // Returns array of { name, pos: string[], team?: string, espnId?: string }
+  // Supports both new React layouts (data-testid="rosterSlot") and legacy tables.
+  // Returns [{ name, team, pos: string[], espnId? }]
   function getRoster() {
-    const rowSelectors = [
-      '[data-testid="rosterTable"] tr',
-      '.Table__TBODY tr',
-      'table tbody tr'
-    ];
-    let rows = [];
-    for (const sel of rowSelectors) {
-      rows = Array.from(document.querySelectorAll(sel));
-      if (rows.length) break;
-    }
-    const players = [];
-    for (const tr of rows) {
-      const a = tr.querySelector('a[href*="/player/_/id/"]');
-      const name = clean(a?.textContent || "");
-      if (!name) continue;
+    // 1) Try modern rows first
+    let rows = Array.from(document.querySelectorAll('[data-testid="rosterSlot"]'));
+    let mode = "modern";
 
-      const href = a?.getAttribute("href") || "";
+    // Fallback to table rows (legacy)
+    if (!rows.length) {
+      rows = Array.from(document.querySelectorAll('[data-testid="rosterTable"] tr, .Table__TBODY tr, table tbody tr'));
+      mode = "table";
+    }
+
+    const roster = [];
+    for (const tr of rows) {
+      // Find name element
+      const nameEl =
+        tr.querySelector('[data-testid="playerName"]') ||
+        tr.querySelector('a[href*="/player/_/id/"]') ||
+        tr.querySelector('a[href*="/player/"]') ||
+        tr.querySelector('.player__columnName') ||
+        tr.querySelector('td a');
+
+      if (!nameEl) continue;
+
+      // Clean player name (strip any trailing status like (DTD))
+      const rawName = clean(nameEl.textContent || "");
+      const name = rawName.replace(/\s+\((?:DTD|O|Q|P|IR|INJ|NA).*?\)$/i, "");
+
+      // Grab ESPN numeric id if present
+      const href = nameEl.getAttribute("href") || "";
       const idMatch = href.match(/\/player\/_\/id\/(\d+)\//);
       const espnId = idMatch ? idMatch[1] : undefined;
 
-      // Position(s) and team (best-effort)
-      let posText = "";
-      let teamText = "";
+      // Team + positions
+      let team = "";
+      let pos = [];
 
-      const posLike = tr.querySelector('[class*="pos"], [data-idx="POS"], td:nth-child(2), span:has(+ span)');
-      if (posLike) posText = clean(posLike.textContent);
+      // Common “TEAM POS” text container (new layout)
+      const teamPosEl =
+        tr.querySelector('[data-testid="playerTeamPos"]') ||
+        tr.querySelector('.player__position') ||
+        tr.querySelector('td:nth-child(3), td[data-idx="POS"]');
 
-      const teamLike = tr.querySelector('[class*="Team"] abbr, [class*="team"], td:nth-child(3) abbr');
-      if (teamLike) teamText = clean(teamLike.textContent);
+      const teamPosText = clean(teamPosEl?.textContent || "");
 
-      const pos = posText
-        ? posText.split(/[,\s/]+/).map(p => p.trim()).filter(Boolean)
-        : [];
+      // Patterns to parse e.g. "LAL PF/SF", "GS PG", "IND PF C"
+      // Prefer team abbreviation first token, then split positions by /, , or whitespace
+      if (teamPosText) {
+        // Try TEAM + positions
+        let m = teamPosText.match(/^([A-Z]{2,3})\s+(.+)$/);
+        if (m) {
+          team = m[1];
+          pos = m[2].split(/[,\s/]+/).filter(Boolean);
+        } else {
+          // Sometimes shows only positions
+          pos = teamPosText.split(/[,\s/]+/).filter(Boolean);
+        }
+      }
 
-      players.push({ name, pos, team: teamText || undefined, espnId });
+      // Legacy tables may show position in 2nd or 3rd cell
+      if (!pos.length) {
+        const cells = tr.querySelectorAll("td");
+        if (cells.length) {
+          const guess = clean(cells[1]?.textContent || cells[2]?.textContent || "");
+          if (guess) pos = guess.split(/[,\s/]+/).filter(Boolean);
+        }
+      }
+
+      // Skip obvious non-player rows
+      if (!name || name === "Player") continue;
+
+      roster.push({ name, team: team || undefined, pos, espnId });
     }
 
+    // De-dup in case of header rows/etc.
     const seen = new Set();
-    return players.filter(p => {
-      const key = `${p.espnId || ""}|${p.name}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
+    const unique = roster.filter(p => {
+      const k = `${p.espnId || ""}|${p.name}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
       return true;
     });
+
+    console.log(`[Brick Layers] ESPN roster parsed (${mode}):`, unique.length);
+    return unique;
   }
 
+  // expose
   window.BLAdapters = window.BLAdapters || {};
   window.BLAdapters.espn = { detectContext, getRoster };
 })();
