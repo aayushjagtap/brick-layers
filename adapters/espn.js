@@ -1,22 +1,20 @@
 // adapters/espn.js
-// Robust ESPN context detector with team-name resolution.
-// Exposes: window.BLAdapters.espn.detectContext()
+// ESPN context + roster extraction
+// Exposes: window.BLAdapters.espn.detectContext(), window.BLAdapters.espn.getRoster()
 
 (function () {
   const host = location.hostname || "";
   const isESPN =
     /(^|\.)espn\.com$/i.test(host) || /(^|\.)fantasy\.espn\.com$/i.test(host);
 
-  // --- small utils ---
+  // ---------- utils ----------
   const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-
   const isGeneric = (s) => {
     if (!s) return true;
     const t = s.toLowerCase();
     if (t.includes("fantasy basketball team clubhouse")) return true;
     if (t === "fantasy basketball") return true;
     if (t === "clubhouse") return true;
-    // discard very short / non-informative strings
     if (t.replace(/[^\w]/g, "").length < 3) return true;
     return false;
   };
@@ -34,8 +32,7 @@
     }
   }
 
-  // Wait for an element that matches any selector (or time out)
-  function waitForAny(selectors, timeoutMs = 2500) {
+  function waitForAny(selectors, timeoutMs = 3000) {
     return new Promise((resolve) => {
       const found = () => {
         for (const sel of selectors) {
@@ -46,7 +43,6 @@
       };
       const first = found();
       if (first) return resolve(first);
-
       const obs = new MutationObserver(() => {
         const el = found();
         if (el) {
@@ -55,7 +51,6 @@
         }
       });
       obs.observe(document.documentElement, { childList: true, subtree: true });
-
       setTimeout(() => {
         obs.disconnect();
         resolve(null);
@@ -63,7 +58,7 @@
     });
   }
 
-  // Strategy A: direct header text (most reliable when present)
+  // ---------- team name strategies ----------
   function teamNameFromHeader() {
     const selectors = [
       '.ClubhouseHeader__TeamName',
@@ -82,7 +77,6 @@
     return null;
   }
 
-  // Strategy B: meta titles often include "{Team Name} - Fantasy Basketball ..."
   function teamNameFromMeta() {
     const metas = [
       document.querySelector('meta[property="og:title"]')?.content,
@@ -98,13 +92,10 @@
     return null;
   }
 
-  // Strategy C: find an anchor that links to *this* team (includes leagueId & teamId)
   function teamNameFromAnchors(leagueId, teamId) {
     if (!leagueId || !teamId) return null;
     const hrefNeedle = `/basketball/team?leagueId=${leagueId}&teamId=${teamId}`;
-    // Grab many anchors to be safe (header nav, sidebars, menus)
     const anchors = Array.from(document.querySelectorAll('a[href*="/basketball/team?"]'));
-    // Prefer exact match start, then contains
     const exact = anchors.find(a => a.getAttribute("href")?.includes(hrefNeedle));
     const cand = exact || anchors.find(a => {
       const h = a.getAttribute("href") || "";
@@ -114,7 +105,6 @@
     return txt && !isGeneric(txt) ? txt : null;
   }
 
-  // Strategy D: general headings that look like custom names
   function teamNameFromGenericHeadings() {
     const cands = Array.from(
       document.querySelectorAll('h1,h2,[class*="TeamName"],[data-testid*="TeamName"]')
@@ -127,6 +117,7 @@
     return null;
   }
 
+  // ---------- public: detect context ----------
   async function detectContext() {
     if (!isESPN) return null;
 
@@ -138,20 +129,20 @@
     const { leagueId, teamId, seasonId } = getParamsFromURL();
     if (!leagueId && !teamId) return null;
 
-    // Give the app a moment to render its header
     await waitForAny(
       [
         '.ClubhouseHeader__TeamName',
         '[data-testid="teamHeaderTeamName"]',
         '[data-testid="clubhouse-header"]',
         'main h1',
-        'header h1'
+        'header h1',
+        '[data-testid="rosterTable"]',
+        '.Table__TBODY'
       ],
-      2500
+      3000
     );
 
-    // Try strategies in order of reliability
-    let teamName =
+    const teamName =
       teamNameFromHeader() ||
       teamNameFromMeta() ||
       teamNameFromAnchors(leagueId, teamId) ||
@@ -167,7 +158,56 @@
     };
   }
 
+  // ---------- public: get roster ----------
+  // Returns array of { name, pos: string[], team?: string, espnId?: string }
+  function getRoster() {
+    const rowSelectors = [
+      '[data-testid="rosterTable"] tr',
+      '.Table__TBODY tr',
+      'table tbody tr'
+    ];
+    let rows = [];
+    for (const sel of rowSelectors) {
+      rows = Array.from(document.querySelectorAll(sel));
+      if (rows.length) break;
+    }
+    const players = [];
+    for (const tr of rows) {
+      const a = tr.querySelector('a[href*="/player/_/id/"]');
+      const name = clean(a?.textContent || "");
+      if (!name) continue;
+
+      const href = a?.getAttribute("href") || "";
+      const idMatch = href.match(/\/player\/_\/id\/(\d+)\//);
+      const espnId = idMatch ? idMatch[1] : undefined;
+
+      // Position(s) and team (best-effort)
+      let posText = "";
+      let teamText = "";
+
+      const posLike = tr.querySelector('[class*="pos"], [data-idx="POS"], td:nth-child(2), span:has(+ span)');
+      if (posLike) posText = clean(posLike.textContent);
+
+      const teamLike = tr.querySelector('[class*="Team"] abbr, [class*="team"], td:nth-child(3) abbr');
+      if (teamLike) teamText = clean(teamLike.textContent);
+
+      const pos = posText
+        ? posText.split(/[,\s/]+/).map(p => p.trim()).filter(Boolean)
+        : [];
+
+      players.push({ name, pos, team: teamText || undefined, espnId });
+    }
+
+    const seen = new Set();
+    return players.filter(p => {
+      const key = `${p.espnId || ""}|${p.name}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
   window.BLAdapters = window.BLAdapters || {};
-  window.BLAdapters.espn = { detectContext };
+  window.BLAdapters.espn = { detectContext, getRoster };
 })();
 

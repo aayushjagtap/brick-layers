@@ -1,4 +1,4 @@
-// background.js (Step 3: data layer + ESPN context handler)
+// background.js (Step 4: data layer + ESPN context + roster persistence)
 
 // ---------- Config ----------
 const STORAGE_KEY = "BL_STATE_V1";
@@ -9,21 +9,19 @@ async function getState() {
   const { [STORAGE_KEY]: s } = await chrome.storage.local.get(STORAGE_KEY);
   return s || defaultState();
 }
-
 async function setState(next) {
   await chrome.storage.local.set({ [STORAGE_KEY]: next });
 }
-
 function defaultState() {
   return {
-    leagues: {},        // [leagueId]: { platform, settings, context, teams, roster }
+    leagues: {},        // [leagueId]: { platform, settings, context, roster }
     projections: {},    // [season]: { [playerId]: { name, team, pos: [], cats: {...} } }
     schedules: {},      // [dateISO]: { [teamAbbr]: { opp, homeAway, b2b } }
     meta: { updatedAt: 0, lastFetch: 0 }
   };
 }
 
-// ---------- Demo data (replace with real feeds later) ----------
+// ---------- Demo data ----------
 function sampleProjections() {
   return {
     "2025": {
@@ -31,33 +29,23 @@ function sampleProjections() {
         name: "LeBron James",
         team: "LAL",
         pos: ["SF", "PF"],
-        cats: {
-          pts: 25.3, reb: 7.8, ast: 7.2, stl: 1.1, blk: 0.6,
-          "3pm": 2.2, fg_pct: 0.52, ft_pct: 0.73, to: 3.4
-        }
+        cats: { pts: 25.3, reb: 7.8, ast: 7.2, stl: 1.1, blk: 0.6, "3pm": 2.2, fg_pct: 0.52, ft_pct: 0.73, to: 3.4 }
       },
       stephen_curry: {
         name: "Stephen Curry",
         team: "GSW",
         pos: ["PG"],
-        cats: {
-          pts: 28.1, reb: 4.4, ast: 6.3, stl: 0.9, blk: 0.2,
-          "3pm": 4.7, fg_pct: 0.47, ft_pct: 0.91, to: 3.2
-        }
+        cats: { pts: 28.1, reb: 4.4, ast: 6.3, stl: 0.9, blk: 0.2, "3pm": 4.7, fg_pct: 0.47, ft_pct: 0.91, to: 3.2 }
       },
       anthony_davis: {
         name: "Anthony Davis",
         team: "DAL",
         pos: ["PF", "C"],
-        cats: {
-          pts: 24.7, reb: 12.1, ast: 3.5, stl: 1.2, blk: 2.3,
-          "3pm": 0.4, fg_pct: 0.57, ft_pct: 0.79, to: 2.1
-        }
+        cats: { pts: 24.7, reb: 12.1, ast: 3.5, stl: 1.2, blk: 2.3, "3pm": 0.4, fg_pct: 0.57, ft_pct: 0.79, to: 2.1 }
       }
     }
   };
 }
-
 function sampleSchedules() {
   return {
     "2025-10-21": {
@@ -126,21 +114,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
         case "GET_DATA": {
           const s = await ensureData();
-          sendResponse({
-            ok: true,
-            data: {
-              projections: s.projections,
-              schedules: s.schedules,
-              meta: s.meta
-            }
-          });
+          sendResponse({ ok: true, data: { projections: s.projections, schedules: s.schedules, meta: s.meta } });
           break;
         }
 
         case "GET_LEAGUE_SETTINGS": {
           const s = await getState();
-          const league = s.leagues?.[msg.leagueId] || null;
-          sendResponse({ ok: true, league });
+          sendResponse({ ok: true, league: s.leagues?.[msg.leagueId] || null });
           break;
         }
 
@@ -150,10 +130,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           s.leagues[msg.leagueId] = {
             ...(s.leagues[msg.leagueId] || {}),
             platform: msg.platform ?? s.leagues[msg.leagueId]?.platform ?? null,
-            settings: {
-              ...(s.leagues[msg.leagueId]?.settings || {}),
-              ...(msg.settings || {})
-            }
+            settings: { ...(s.leagues[msg.leagueId]?.settings || {}), ...(msg.settings || {}) }
           };
           s.meta.updatedAt = Date.now();
           await setState(s);
@@ -161,27 +138,34 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           break;
         }
 
-        // NEW in Step 3: persist ESPN context from adapter
         case "UPSERT_LEAGUE_CONTEXT": {
           const s = await getState();
           const { leagueId, platform, context } = msg;
-          if (!leagueId) {
-            sendResponse({ ok: false, error: "missing_leagueId" });
-            break;
-          }
+          if (!leagueId) { sendResponse({ ok: false, error: "missing_leagueId" }); break; }
           s.leagues = s.leagues || {};
           const prev = s.leagues[leagueId] || {};
           s.leagues[leagueId] = {
             ...prev,
             platform: platform ?? prev.platform ?? "espn",
-            context: {
-              ...(prev.context || {}),
-              ...(context || {}) // e.g., { teamId, seasonId, teamName }
-            }
+            context: { ...(prev.context || {}), ...(context || {}) }
           };
           s.meta.updatedAt = Date.now();
           await setState(s);
           sendResponse({ ok: true, league: s.leagues[leagueId] });
+          break;
+        }
+
+        // NEW: roster persistence
+        case "UPSERT_ROSTER": {
+          const s = await getState();
+          const { leagueId, roster } = msg;
+          if (!leagueId) { sendResponse({ ok: false, error: "missing_leagueId" }); break; }
+          s.leagues = s.leagues || {};
+          const prev = s.leagues[leagueId] || {};
+          s.leagues[leagueId] = { ...prev, roster: Array.isArray(roster) ? roster : (prev.roster || []) };
+          s.meta.updatedAt = Date.now();
+          await setState(s);
+          sendResponse({ ok: true, roster: s.leagues[leagueId].roster });
           break;
         }
 
