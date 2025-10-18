@@ -1,0 +1,9 @@
+{
+  "projections": {
+    "2026": {
+      "201939": { "id":"201939","name":"Stephen Curry","team":"GSW","pos":["PG"],"cats":{"pts":28,"reb":4,"ast":6,"stl":1.1,"blk":0.3,"3pm":4.7,"fg_pct":0.47,"ft_pct":0.92,"to":3.1} }
+    }
+  },
+  "schedules": {},
+  "meta": { "updatedAt": 1730000000000 }
+}

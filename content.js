@@ -1,4 +1,4 @@
-// content.js — Sidebar + Draft (Live Draft Mode) + ESPN context & roster
+// content.js — Sidebar + ESPN player-pool fetch + Live Draft + Needs-based ranking
 
 (() => {
   if (window.top !== window) return;
@@ -16,14 +16,85 @@
   const HOST_ID = "brick-layers-host";
   if (document.getElementById(HOST_ID)) return;
 
-  // Draft core
+  // -------- ESPN: load all NBA players (like draft room) --------
+  async function loadEspnAllPlayers(seasonId) {
+    if (!seasonId) {
+      const q = new URLSearchParams(location.search);
+      seasonId = q.get("seasonId") || q.get("season") || new Date().getFullYear();
+    }
+
+    const BASE = `https://fantasy.espn.com/apis/v3/games/fba/seasons/${seasonId}`;
+    const LIMIT = 200;
+    let offset = 0;
+    const all = [];
+
+    const SLOT_TO_POS = {
+      0: "PG", 1: "SG", 2: "SF", 3: "PF", 4: "C",
+      5: "G", 6: "F", 7: "UTIL",
+      8: "BE", 9: "IR", 10: "IL", 11: "IL+", 12: "NA"
+    };
+
+    while (true) {
+      const url = `${BASE}/players?scoringPeriodId=1&view=kona_player_info&limit=${LIMIT}&offset=${offset}`;
+      const res = await fetch(url, { credentials: "include" });
+      if (!res.ok) throw new Error(`ESPN players fetch failed: ${res.status}`);
+      const page = await res.json();
+      if (!Array.isArray(page) || page.length === 0) break;
+
+      for (const row of page) {
+        const p = row?.player || row;
+        const id = String(p.id ?? row.id);
+        const name = (p.fullName || `${p.firstName || ""} ${p.lastName || ""}`).trim();
+
+        const teamAbbrev =
+          p.proTeam?.abbrev ||
+          (p.proTeamId && (row.proTeams?.[p.proTeamId]?.abbrev || "")) ||
+          "";
+
+        const pos = Array.from(
+          new Set((p.eligibleSlots || [])
+            .map(s => SLOT_TO_POS[s])
+            .filter(Boolean)
+            .filter(x => !["BE","IR","IL","IL+","NA"].includes(x)))
+        );
+
+        all.push({ id, name, team: teamAbbrev, pos });
+      }
+
+      offset += page.length;
+      if (page.length < LIMIT) break;
+    }
+
+    console.log(`[Brick Layers] ESPN players loaded: ${all.length} for season ${seasonId}`);
+    return { seasonId: String(seasonId), players: all };
+  }
+
+  function asZeroProjections(players, seasonKey) {
+    const byId = {};
+    for (const p of players) {
+      byId[p.id] = {
+        id: p.id,
+        name: p.name,
+        team: p.team,
+        pos: p.pos,
+        cats: { pts:0, reb:0, ast:0, stl:0, blk:0, "3pm":0, fg_pct:0, ft_pct:0, to:0 }
+      };
+    }
+    return {
+      projections: { [seasonKey]: byId },
+      schedules: {},
+      meta: { updatedAt: Date.now() }
+    };
+  }
+
+  // -------- Draft core module --------
   let DraftCore = null;
   (async () => {
     try { DraftCore = await import(chrome.runtime.getURL("core/draft.js")); }
-    catch (e) { console.warn("[Brick Layers] draft import failed:", e); }
+    catch (e) { console.warn("[BL] draft import failed:", e); }
   })();
 
-  // Detect ESPN context
+  // -------- ESPN context -> save --------
   (async () => {
     try {
       if (window.BLAdapters?.espn) {
@@ -39,7 +110,7 @@
     } catch (e) { console.warn("[BL] ESPN detect failed:", e); }
   })();
 
-  // Data cache
+  // -------- Data cache --------
   let _dataCache = null;
   function getData(cb) {
     if (_dataCache) return cb(_dataCache);
@@ -50,7 +121,7 @@
     });
   }
 
-  // Demo league
+  // -------- Demo league record --------
   chrome.runtime.sendMessage({
     type: "UPSERT_LEAGUE_SETTINGS",
     leagueId: "demo-league-1",
@@ -58,7 +129,7 @@
     settings: { scoring: "H2H", categories: ["pts","reb","ast","stl","blk","3pm","fg_pct","ft_pct","to"] }
   }, () => {});
 
-  // Scrape roster
+  // -------- Roster scrape & save --------
   (async () => {
     try {
       if (!window.BLAdapters?.espn) return;
@@ -79,7 +150,7 @@
     } catch (e) { console.warn("[BL] roster parse failed:", e); }
   })();
 
-  // Badge
+  // -------- Badge --------
   const host = document.createElement("div");
   host.id = HOST_ID;
   host.style.position = "fixed";
@@ -116,7 +187,7 @@
   });
   shadow.appendChild(style); shadow.appendChild(wrap);
 
-  // Sidebar
+  // -------- Sidebar & Draft --------
   function renderSidebar(leagueId, roster) {
     const SIDEBAR_ID = "brick-layers-sidebar";
     if (document.getElementById(SIDEBAR_ID)) return;
@@ -196,33 +267,41 @@
     }
 
     function renderUpcoming() {
-      getData(({ schedules }) => {
-        const days = Object.keys(schedules || {}).sort().slice(0, 4);
-        body.innerHTML = `<ul>${
-          days.map(d => {
-            const games = Object.entries(schedules[d] || {});
-            const descr = games.slice(0, 3).map(([team, g]) => `${team}@${g.opp}`).join(" • ");
-            return `<li><span>${d}</span><span class="sub">${descr || "—"}</span></li>`;
-          }).join("")
-        }</ul>`;
-      });
+      // optional schedules demo left as-is
+      body.innerHTML = `<div class="sub">Upcoming schedule demo</div>`;
     }
 
-    // ---------------- Draft (with Live Draft Mode) ----------------
+    // ---------------- Draft (ESPN pool + Live Draft) ----------------
     function renderDraft() {
       if (!DraftCore) { body.innerHTML = `<div class="sub">Loading draft engine…</div>`; setTimeout(renderDraft, 150); return; }
 
-      getData(({ projections }) => {
-        const season = Object.keys(projections || {})[0];
-        const players = (projections || {})[season] || {};
+      getData(async ({ projections }) => {
+        let season = Object.keys(projections || {})[0];
+        let players = (projections || {})[season] || {};
+
+        // If we don't have a real dataset yet, pull ESPN's entire player pool and cache it
+        if (!season || Object.keys(players).length < 50) {
+          try {
+            const { seasonId, players: pool } = await loadEspnAllPlayers();
+            const zeroProj = asZeroProjections(pool, seasonId);
+            season = seasonId;
+            players = zeroProj.projections[seasonId];
+
+            // cache in background for later loads
+            chrome.runtime.sendMessage({ type: "UPSERT_LOADED_PLAYERS", data: zeroProj }, () => {});
+          } catch (e) {
+            console.warn("[BL] ESPN player pool load failed:", e);
+            body.innerHTML = `<div class="sub">Couldn’t load ESPN player pool. Open from fantasy.espn.com while logged in.</div>`;
+            return;
+          }
+        }
+
         const cats = ["pts","reb","ast","stl","blk","3pm","fg_pct","ft_pct","to"];
 
-        // fetch league to see roster; if empty → live draft mode by default
         chrome.runtime.sendMessage({ type: "GET_LEAGUE_SETTINGS", leagueId }, (resp) => {
           const savedRoster = resp?.league?.roster || [];
           const liveDraftDefault = savedRoster.length === 0;
 
-          // UI skeleton
           body.innerHTML = "";
           const topRow = document.createElement("div");
           topRow.className = "row";
@@ -237,7 +316,6 @@
           `;
           body.appendChild(topRow);
 
-          // Sliders
           const weightsWrap = document.createElement("div");
           weightsWrap.className = "row";
           weightsWrap.style.gap = "8px";
@@ -250,7 +328,6 @@
           `).join("");
           body.appendChild(weightsWrap);
 
-          // Live draft controls
           const liveWrap = document.createElement("div");
           liveWrap.className = "row";
           liveWrap.style.width = "100%";
@@ -269,35 +346,20 @@
           const listWrap = document.createElement("div");
           body.appendChild(listWrap);
 
-          // state
           const state = {
             pos: "",
             useNeeds: true,
             liveDraft: liveDraftDefault,
             manualWeights: Object.fromEntries(cats.map(c => [c, 1])),
-            drafted: [], // player ids (from background)
+            drafted: [],
             myPicks: []
           };
 
-          // init sliders
-          for (const c of cats) {
-            const lab = weightsWrap.querySelector(`[data-lab="${c}"]`);
-            lab.textContent = "1.00";
-          }
-
-          // load draft state
           chrome.runtime.sendMessage({ type: "DRAFT_GET_STATE", leagueId }, (r) => {
-            if (r?.ok) {
-              state.drafted = r.state.drafted || [];
-              state.myPicks = r.state.myPicks || [];
-              updatePickedList();
-              renderList();
-            } else {
-              renderList();
-            }
+            if (r?.ok) { state.drafted = r.state.drafted || []; state.myPicks = r.state.myPicks || []; updatePickedList(); renderList(); }
+            else { renderList(); }
           });
 
-          // events
           topRow.querySelector("#posf").addEventListener("change", e => { state.pos = e.target.value || ""; renderList(); });
           topRow.querySelector("#useNeeds").addEventListener("change", e => { state.useNeeds = !!e.target.checked; renderList(); });
           topRow.querySelector("#liveDraft").addEventListener("change", e => { state.liveDraft = !!e.target.checked; renderList(); });
@@ -317,10 +379,7 @@
           liveWrap.querySelector("#pickThem").addEventListener("click", () => addPick(false));
           liveWrap.querySelector("#resetDraft").addEventListener("click", () => {
             chrome.runtime.sendMessage({ type: "DRAFT_RESET", leagueId }, (r) => {
-              if (r?.ok) {
-                state.drafted = []; state.myPicks = [];
-                updatePickedList(); renderList();
-              }
+              if (r?.ok) { state.drafted = []; state.myPicks = []; updatePickedList(); renderList(); }
             });
           });
 
@@ -332,11 +391,9 @@
             if (!hit) return;
             chrome.runtime.sendMessage({ type: "DRAFT_ADD_PICK", leagueId, playerId: hit.id || hit.name, mine }, (r) => {
               if (r?.ok) {
-                state.drafted = r.state.drafted;
-                state.myPicks = r.state.myPicks;
+                state.drafted = r.state.drafted; state.myPicks = r.state.myPicks;
                 liveWrap.querySelector("#search").value = "";
-                updatePickedList();
-                renderList();
+                updatePickedList(); renderList();
               }
             });
           }
@@ -347,16 +404,15 @@
             liveWrap.querySelector("#pickedList").innerHTML =
               names.length ? names.map((n, i) => {
                 const id = state.drafted[i];
-                const mineTag = mine.has(id) ? " (me)" : "";
-                return `<span class="chip" style="margin:2px;">${n}${mineTag}</span>`;
+                const tag = mine.has(id) ? " (me)" : "";
+                return `<span class="chip" style="margin:2px;">${n}${tag}</span>`;
               }).join(" ") : `<span class="sub">(no picks yet)</span>`;
           }
 
           function effectiveWeights(myPlayers) {
-            // needs (0.5..1.5) from my picks or roster; multiplied by manual sliders
             let needs = Object.fromEntries(cats.map(c => [c, 1]));
             if (state.useNeeds) {
-              const source = (state.liveDraft ? myPlayers : null) || // use drafted-by-me in live mode
+              const source = (state.liveDraft ? myPlayers : null) ||
                              (savedRoster.length ? DraftCore.mapRosterToProjections(savedRoster, players).matched : []);
               if (source && source.length) {
                 const { teamZ } = DraftCore.teamZFromRoster(source, players, cats);
@@ -369,21 +425,18 @@
           }
 
           function renderList() {
-            // Compute "my players" for needs: either my picks (live) or saved roster
             const myPlayers = state.liveDraft
               ? state.myPicks.map(id => players[id]).filter(Boolean)
               : DraftCore.mapRosterToProjections(savedRoster, players).matched;
 
             const weights = effectiveWeights(myPlayers);
-            const ownedNames = []; // we handle exclusion via drafted ids instead
-            // build filters: pos + exclude drafted
             const pool = { ...players };
             for (const id of state.drafted) delete pool[id];
 
             const top = DraftCore.bestAvailable(pool, cats, weights, {
               pos: state.pos ? [state.pos] : [],
-              ownedNames
-            }).slice(0, 20);
+              ownedNames: []
+            }).slice(0, 25);
 
             listWrap.innerHTML = `
               <ul>
@@ -399,7 +452,6 @@
             `;
           }
 
-          // initial draw
           renderList();
         });
       });
