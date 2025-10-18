@@ -2,7 +2,6 @@
 // Minimal z-score & positional-replacement scaffolding for "Best Available".
 
 export function computeCategoryStats(playersById, cats) {
-  // Build per-cat arrays, then mean/std
   const catVals = {};
   cats.forEach(c => (catVals[c] = []));
   for (const p of Object.values(playersById)) {
@@ -33,9 +32,6 @@ export function zScores(p, stats, cats) {
 }
 
 export function replacementLevels(playersById, league) {
-  // Very simple: for each POS, replacement = Nth best by pts (proxy),
-  // where N ≈ teams * startersPerPos
-  // You can refine later per your league settings.
   const teams = league?.teamsCount || 12;
   const starters = league?.startersPerPos || { PG: 1, SG: 1, SF: 1, PF: 1, C: 1, G: 0, F: 0, UTIL: 2 };
   const pool = Object.values(playersById);
@@ -59,12 +55,10 @@ export function replacementLevels(playersById, league) {
 }
 
 export function draftValue(z, weights) {
-  // Sum weighted z-scores; turnovers treated negative if present.
   let sum = 0;
   for (const [cat, val] of Object.entries(z)) {
     const w = weights?.[cat] ?? 1;
-    if (cat === "to") sum += (w * -val);
-    else sum += (w * val);
+    sum += (cat === "to") ? (w * -val) : (w * val);
   }
   return sum;
 }

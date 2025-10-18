@@ -1,4 +1,4 @@
-// content.js — Step 5 (context + roster + tabbed sidebar + Draft: Best Available)
+// content.js — Draft module via real import + tabbed sidebar (Roster / Draft / Upcoming)
 
 (() => {
   if (window.top !== window) return;
@@ -16,19 +16,11 @@
   const HOST_ID = "brick-layers-host";
   if (document.getElementById(HOST_ID)) return;
 
-  // --- Load draft core (as an ES module injected at runtime) ---
+  // --- Load the Draft core as a real module (fast & reliable) ---
   let DraftCore = null;
   (async () => {
     try {
-      // Dynamically import /core/draft.js via blob to work from content script
-      const code = `
-        ${draftCoreSource()}
-        export { computeCategoryStats, zScores, replacementLevels, draftValue, bestAvailable };
-      `;
-      const blob = new Blob([code], { type: "text/javascript" });
-      const modUrl = URL.createObjectURL(blob);
-      DraftCore = await import(modUrl);
-      URL.revokeObjectURL(modUrl);
+      DraftCore = await import(chrome.runtime.getURL("core/draft.js"));
     } catch (e) {
       console.warn("[Brick Layers] failed to load Draft core:", e);
     }
@@ -61,7 +53,7 @@
     }
   })();
 
-  // Ask background for stored data (projections + schedule)
+  // --- Projections + Schedules (demo data) ---
   let _dataCache = null;
   function getData(cb) {
     if (_dataCache) return cb(_dataCache);
@@ -83,7 +75,7 @@
     });
   }
 
-  // Optional demo league entry (kept)
+  // --- Optional demo league entry ---
   chrome.runtime.sendMessage({
     type: "UPSERT_LEAGUE_SETTINGS",
     leagueId: "demo-league-1",
@@ -95,7 +87,7 @@
     }
   }, (resp) => { if (resp?.ok) console.log("[Brick Layers] league saved:", resp.league); });
 
-  // --- Fetch roster from ESPN DOM and persist it ---
+  // --- Scrape roster from ESPN and persist it ---
   (async () => {
     try {
       if (!window.BLAdapters?.espn) return;
@@ -163,8 +155,7 @@
   wrap.querySelector("#openSidebar").addEventListener("click", () => {
     const params = new URLSearchParams(location.search);
     const leagueId = params.get("leagueId") || "demo-league-1";
-    // Render empty roster if not scraped yet
-    renderSidebar(leagueId, []);
+    renderSidebar(leagueId, []); // open immediately; roster fills when saved
   });
   shadow.appendChild(style); shadow.appendChild(wrap);
   console.log("[Brick Layers] badge injected on:", location.hostname);
@@ -201,7 +192,7 @@
       .close{cursor:pointer;opacity:.85;} .close:hover{opacity:1;}
       .row{display:flex;gap:8px;align-items:center;margin-bottom:8px;}
       select{background:#0b1220;color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:4px 6px;}
-      .num{font-variant-numeric:tabular-nums;}
+      .sub{opacity:.8;font-size:12px;} .num{font-variant-numeric:tabular-nums;}
     `;
     const wrap = document.createElement("div");
     wrap.className = "panel";
@@ -229,24 +220,19 @@
       renderTab(t.dataset.tab);
     }));
 
-    // Render initial
     renderTab("roster");
 
     function renderTab(which) {
-      if (which === "roster") {
-        renderRoster();
-      } else if (which === "draft") {
-        renderDraft();
-      } else {
-        renderUpcoming();
-      }
+      if (which === "roster") renderRoster();
+      else if (which === "draft") renderDraft();
+      else renderUpcoming();
     }
 
     function renderRoster() {
       const list = (roster && roster.length) ? roster : [{ name: "(scraping…)", pos: [], team: "" }];
-      body.innerHTML = `<div class="row"><div class="pill">Players ${list.length}</div></div><ul>${list.map(p =>
-        `<li><span>${p.name}</span><span class="sub">${(p.team || "")} ${p.pos?.join("/") || ""}</span></li>`
-      ).join("")}</ul>`;
+      body.innerHTML = `<div class="row"><div class="pill">Players ${list.length}</div></div><ul>${
+        list.map(p => `<li><span>${p.name}</span><span class="sub">${(p.team || "")} ${p.pos?.join("/") || ""}</span></li>`).join("")
+      }</ul>`;
     }
 
     function renderUpcoming() {
@@ -265,7 +251,7 @@
     function renderDraft() {
       if (!DraftCore) {
         body.innerHTML = `<div class="sub">Loading draft engine…</div>`;
-        setTimeout(renderDraft, 200);
+        setTimeout(renderDraft, 150);
         return;
       }
       getData(({ projections }) => {
@@ -309,104 +295,4 @@
       });
     }
   }
-
-  // Inline source for /core/draft.js (so we can import via blob without packaging changes)
-  function draftCoreSource() {
-    // NOTE: keep this in sync with core/draft.js
-    return `
-      ${computeCategoryStats_src()}
-      ${zScores_src()}
-      ${replacementLevels_src()}
-      ${draftValue_src()}
-      ${bestAvailable_src()}
-    `;
-  }
-
-  function computeCategoryStats_src(){return `
-    function computeCategoryStats(playersById, cats) {
-      const catVals = {}; cats.forEach(c => (catVals[c] = []));
-      for (const p of Object.values(playersById)) {
-        cats.forEach(c => {
-          const v = p.cats?.[c];
-          if (typeof v === "number" && isFinite(v)) catVals[c].push(v);
-        });
-      }
-      const stats = {};
-      cats.forEach(c => {
-        const arr = catVals[c];
-        const mean = arr.reduce((a, b) => a + b, 0) / Math.max(arr.length, 1);
-        const variance = arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / Math.max(arr.length, 1);
-        const std = Math.sqrt(variance) || 1e-9;
-        stats[c] = { mean, std };
-      });
-      return stats;
-    }
-    export { computeCategoryStats };
-  `}
-
-  function zScores_src(){return `
-    function zScores(p, stats, cats) {
-      const z = {};
-      cats.forEach(c => {
-        const v = p.cats?.[c];
-        const st = stats[c] || { mean: 0, std: 1 };
-        z[c] = typeof v === "number" ? (v - st.mean) / (st.std || 1e-9) : 0;
-      });
-      return z;
-    }
-    export { zScores };
-  `}
-
-  function replacementLevels_src(){return `
-    function replacementLevels(playersById, league) {
-      const teams = league?.teamsCount || 12;
-      const starters = league?.startersPerPos || { PG:1, SG:1, SF:1, PF:1, C:1, G:0, F:0, UTIL:2 };
-      const pool = Object.values(playersById);
-      const byPos = {}; Object.keys(starters).forEach(pos => (byPos[pos] = []));
-      for (const p of pool) (p.pos || []).forEach(pos => { if (byPos[pos]) byPos[pos].push(p); });
-      const repl = {};
-      for (const pos of Object.keys(byPos)) {
-        const arr = byPos[pos].slice().sort((a, b) => (b.cats?.pts || 0) - (a.cats?.pts || 0));
-        const n = Math.max(1, teams * Math.max(1, starters[pos]));
-        const idx = Math.min(arr.length - 1, n - 1);
-        repl[pos] = arr[idx] || null;
-      }
-      return repl;
-    }
-    export { replacementLevels };
-  `}
-
-  function draftValue_src(){return `
-    function draftValue(z, weights) {
-      let sum = 0;
-      for (const [cat, val] of Object.entries(z)) {
-        const w = weights?.[cat] ?? 1;
-        sum += (cat === "to") ? (w * -val) : (w * val);
-      }
-      return sum;
-    }
-    export { draftValue };
-  `}
-
-  function bestAvailable_src(){return `
-    import { computeCategoryStats } from 'data:text/javascript,export{}';
-    import { zScores } from 'data:text/javascript,export{}';
-    import { draftValue } from 'data:text/javascript,export{}';
-
-    function bestAvailable(playersById, cats, weights, filters = {}) {
-      const stats = computeCategoryStats(playersById, cats);
-      const list = [];
-      for (const [id, p] of Object.entries(playersById)) {
-        if (filters.pos && filters.pos.length) {
-          const ok = (p.pos || []).some(pp => filters.pos.includes(pp));
-          if (!ok) continue;
-        }
-        const z = zScores(p, stats, cats);
-        const dv = draftValue(z, weights);
-        list.push({ id, player: p, z, dv });
-      }
-      return list.sort((a, b) => b.dv - a.dv);
-    }
-    export { bestAvailable };
-  `}
 })();
