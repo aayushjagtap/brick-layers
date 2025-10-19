@@ -1,4 +1,5 @@
-// content.js — Sidebar + ESPN player-pool fetch + Live Draft + Needs-based ranking
+// content.js — Sidebar + ESPN ranked player-pool + Sleeper ACTIVE fallback
+// + projections scraper (auto-paginates when you visit ESPN projections page)
 
 (() => {
   if (window.top !== window) return;
@@ -16,17 +17,16 @@
   const HOST_ID = "brick-layers-host";
   if (document.getElementById(HOST_ID)) return;
 
-  // -------- ESPN: load all NBA players (like draft room) --------
+  // -------- ESPN: load NBA players for CURRENT SEASON with draft ranks --------
   async function loadEspnAllPlayers(seasonId) {
     if (!seasonId) {
       const q = new URLSearchParams(location.search);
       seasonId = q.get("seasonId") || q.get("season") || new Date().getFullYear();
     }
+    seasonId = String(seasonId);
 
     const BASE = `https://fantasy.espn.com/apis/v3/games/fba/seasons/${seasonId}`;
     const LIMIT = 200;
-    let offset = 0;
-    const all = [];
 
     const SLOT_TO_POS = {
       0: "PG", 1: "SG", 2: "SF", 3: "PF", 4: "C",
@@ -34,18 +34,12 @@
       8: "BE", 9: "IR", 10: "IL", 11: "IL+", 12: "NA"
     };
 
-    while (true) {
-      const url = `${BASE}/players?scoringPeriodId=1&view=kona_player_info&limit=${LIMIT}&offset=${offset}`;
-      const res = await fetch(url, { credentials: "include" });
-      if (!res.ok) throw new Error(`ESPN players fetch failed: ${res.status}`);
-      const page = await res.json();
-      if (!Array.isArray(page) || page.length === 0) break;
-
-      for (const row of page) {
+    const all = [];
+    const pushPage = (arr) => {
+      for (const row of arr) {
         const p = row?.player || row;
         const id = String(p.id ?? row.id);
         const name = (p.fullName || `${p.firstName || ""} ${p.lastName || ""}`).trim();
-
         const teamAbbrev =
           p.proTeam?.abbrev ||
           (p.proTeamId && (row.proTeams?.[p.proTeamId]?.abbrev || "")) ||
@@ -58,17 +52,242 @@
             .filter(x => !["BE","IR","IL","IL+","NA"].includes(x)))
         );
 
-        all.push({ id, name, team: teamAbbrev, pos });
-      }
+        const rankStd =
+          p.draftRanksByRankType?.STANDARD?.rank ??
+          p.draftRanksByRankType?.ROTO?.rank ??
+          p.ratings?.[0]?.rank ?? null;
 
+        const owned = p.ownership?.percentOwned ?? 0;
+
+        all.push({ id, name, team: teamAbbrev, pos, rank: rankStd, owned });
+      }
+    };
+
+    // (A) Simple GET paging
+    let offset = 0;
+    try {
+      while (true) {
+        const url = `${BASE}/players?scoringPeriodId=1&view=kona_player_info&limit=${LIMIT}&offset=${offset}`;
+        const res = await fetch(url, { credentials: "include" });
+        if (!res.ok) throw new Error(`A-get ${res.status}`);
+        const page = await res.json();
+        if (!Array.isArray(page) || page.length === 0) break;
+        pushPage(page);
+        offset += page.length;
+        if (page.length < LIMIT) break;
+      }
+      if (all.length > 0) {
+        console.log(`[Brick Layers] ESPN players (simple) ${all.length} for ${seasonId}`);
+        return { seasonId, players: all };
+      }
+    } catch (e) {
+      console.warn("[Brick Layers] ESPN simple GET failed, trying X-Fantasy-Filter:", e);
+    }
+
+    // (B) Official draft-room style with X-Fantasy-Filter
+    const FILTER_TEMPLATE = (offset) => ({
+      players: {
+        filterStatus: { value: ["FREEAGENT", "ONTEAM"] },
+        filterSlotIds: { value: [0,1,2,3,4,5,6,7,8,9,10,11,12] },
+        filterRanksForScoringPeriodIds: { value: [1] },
+        filterRanksForRankTypes: { value: ["STANDARD"] },
+        sortDraftRanks: { sortPriority: 1, sortAsc: true, value: "STANDARD" },
+        limit: LIMIT,
+        offset
+      }
+    });
+
+    offset = 0;
+    while (true) {
+      const url = `${BASE}/players?scoringPeriodId=1&view=kona_player_info`;
+      const headers = { "X-Fantasy-Filter": JSON.stringify(FILTER_TEMPLATE(offset)) };
+      const res = await fetch(url, { credentials: "include", headers });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error("[Brick Layers] ESPN filter fetch failed", res.status, text?.slice(0, 200));
+        throw new Error(`B-filter ${res.status}`);
+      }
+      const page = await res.json();
+      if (!Array.isArray(page) || page.length === 0) break;
+      pushPage(page);
       offset += page.length;
       if (page.length < LIMIT) break;
     }
 
-    console.log(`[Brick Layers] ESPN players loaded: ${all.length} for season ${seasonId}`);
-    return { seasonId: String(seasonId), players: all };
+    // Deduplicate best ranks
+    const byId = new Map();
+    for (const p of all) {
+      const prev = byId.get(p.id);
+      if (!prev || (prev.rank ?? 99999) > (p.rank ?? 99999)) byId.set(p.id, p);
+    }
+    const players = [...byId.values()];
+
+    console.log(`[Brick Layers] ESPN players (filter) ${players.length} for ${seasonId}`);
+    return { seasonId, players };
   }
 
+  // -------- Sleeper fallback: ACTIVE players only --------
+  async function loadSleeperPlayers() {
+    const res = await fetch("https://api.sleeper.app/v1/players/nba");
+    if (!res.ok) throw new Error("Sleeper players fetch failed");
+    const data = await res.json();
+    const all = [];
+    for (const [id, p] of Object.entries(data)) {
+      if (p?.active !== true) continue;
+      if (!p?.team) continue;
+      if (!p?.full_name) continue;
+      const pos = Array.isArray(p.fantasy_positions) ? p.fantasy_positions : (p.position ? [p.position] : []);
+      all.push({ id: String(id), name: p.full_name, team: p.team, pos: pos.filter(Boolean), rank: null, owned: 0 });
+    }
+    console.log(`[Brick Layers] Sleeper ACTIVE players: ${all.length}`);
+    const year = new URLSearchParams(location.search).get("seasonId") || String(new Date().getFullYear());
+    return { seasonId: year, players: all };
+  }
+
+  // -------- Projections: manual page scraper (auto-pagination) --------
+  function isEspnProjectionsPage() {
+    return location.hostname.endsWith("espn.com") &&
+           location.pathname.startsWith("/basketball/players/projections");
+  }
+
+  // Click a button and wait a tick
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function normalizePct(val) {
+    // ESPN may render 47.3 or .473 — normalize to 0.473
+    const n = Number(val);
+    if (!Number.isFinite(n)) return 0;
+    return n > 1.2 ? n / 100 : n; // anything > 1 is likely percent form
+  }
+
+  async function scrapeEspnProjectionsAndCache() {
+    // Wait the first tbody
+    const waitTbody = async () => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < 8000) {
+        const el = document.querySelector(".Table__TBODY");
+        if (el) return el;
+        await sleep(200);
+      }
+      return null;
+    };
+    const firstTbody = await waitTbody();
+    if (!firstTbody) { console.warn("[Brick Layers] projections table not found"); return; }
+
+    const q = new URLSearchParams(location.search);
+    const seasonId = q.get("seasonId") || q.get("season") || String(new Date().getFullYear());
+
+    const readHeaders = () =>
+      Array.from(document.querySelectorAll(".Table__THEAD th"))
+        .map(th => (th.textContent || "").trim().toUpperCase());
+
+    const locateCols = (headers) => {
+      const colIx = (opts) => {
+        const L = Array.isArray(opts) ? opts : [opts];
+        for (const l of L) {
+          const i = headers.findIndex(h => h === l || h.includes(l));
+          if (i !== -1) return i;
+        }
+        return -1;
+      };
+      return {
+        PLAYER: colIx("PLAYER"),
+        TEAMPOS: colIx(["TYPE","TEAM","POS"]),
+        PTS: colIx("PTS"),
+        REB: colIx("REB"),
+        AST: colIx("AST"),
+        STL: colIx("STL"),
+        BLK: colIx("BLK"),
+        TPM: colIx(["3PM","3-PT"]),
+        FG:  colIx("FG%"),
+        FT:  colIx("FT%"),
+        TO:  colIx(["TO","TOV"])
+      };
+    };
+
+    const projById = {};
+    const readPage = () => {
+      const headers = readHeaders();
+      const ix = locateCols(headers);
+      const num = (s) => {
+        const t = String(s || "").replace(/[^\d.\-]/g, "");
+        const v = parseFloat(t);
+        return Number.isFinite(v) ? v : 0;
+      };
+      for (const tr of Array.from(document.querySelectorAll(".Table__TBODY tr"))) {
+        const tds = tr.querySelectorAll("td");
+        if (!tds.length) continue;
+        const a = tds[ix.PLAYER]?.querySelector('a[href*="/player/"]');
+        const name = (a?.textContent || "").trim();
+        if (!name) continue;
+        const href = a?.getAttribute("href") || "";
+        const m = href.match(/\/player\/_\/id\/(\d+)\//);
+        const id = m ? m[1] : name;
+
+        let team = "", pos = [];
+        const rawTP = (tds[ix.TEAMPOS]?.textContent || "").trim().replace(/\s+/g," ");
+        if (rawTP) {
+          const parts = rawTP.split(" ");
+          const maybePos = parts[parts.length - 1];
+          if (/[A-Z]{1,3}(?:\/[A-Z]{1,3})*/.test(maybePos)) {
+            team = parts.slice(0, -1).join(" ");
+            pos = maybePos.split("/");
+          } else {
+            team = rawTP;
+          }
+        }
+
+        const cats = {
+          pts:   num(tds[ix.PTS]?.textContent),
+          reb:   num(tds[ix.REB]?.textContent),
+          ast:   num(tds[ix.AST]?.textContent),
+          stl:   num(tds[ix.STL]?.textContent),
+          blk:   num(tds[ix.BLK]?.textContent),
+          "3pm": num(tds[ix.TPM]?.textContent),
+          fg_pct: normalizePct(num(tds[ix.FG]?.textContent)),
+          ft_pct: normalizePct(num(tds[ix.FT]?.textContent)),
+          to:    num(tds[ix.TO]?.textContent)
+        };
+
+        projById[id] = { id, name, team, pos, cats, metaRank: null, metaOwned: 0 };
+      }
+    };
+
+    // Scrape first page
+    readPage();
+
+    // Keep clicking "Next" (or ">" button) until disabled/not present
+    // ESPN usually uses buttons with aria-labels or visible text like "Next"
+    const isDisabled = (btn) => btn.disabled || btn.getAttribute("aria-disabled") === "true";
+    const findNextBtn = () =>
+      document.querySelector('button[aria-label*="Next"], button[aria-label*="next"], .Pagination__Button--next');
+
+    // Try up to 2000 players safety
+    let pageGuard = 0;
+    while (pageGuard < 60) {
+      pageGuard++;
+      const nextBtn = findNextBtn();
+      if (!nextBtn || isDisabled(nextBtn)) break;
+      nextBtn.click();
+      // wait page swap
+      await sleep(500);
+      readPage();
+      // tiny yield to allow virtualized rows
+      await sleep(150);
+    }
+
+    const count = Object.keys(projById).length;
+    const pack = { projections: { [seasonId]: projById }, schedules: {}, meta: { updatedAt: Date.now() } };
+    await new Promise(r => chrome.runtime.sendMessage({ type: "UPSERT_LOADED_PLAYERS", data: pack }, () => r()));
+    console.log(`[Brick Layers] scraped ESPN projections: ${count} players for ${seasonId}`);
+  }
+
+  // Run scraper only when you open the ESPN projections page manually
+  if (isEspnProjectionsPage()) {
+    scrapeEspnProjectionsAndCache().catch(e => console.warn("[Brick Layers] projections scrape failed:", e));
+  }
+
+  // -------- Convert pool → zero projections (keeps ESPN rank for fallback sort) --------
   function asZeroProjections(players, seasonKey) {
     const byId = {};
     for (const p of players) {
@@ -77,17 +296,15 @@
         name: p.name,
         team: p.team,
         pos: p.pos,
+        metaRank: p.rank ?? null,
+        metaOwned: p.owned ?? 0,
         cats: { pts:0, reb:0, ast:0, stl:0, blk:0, "3pm":0, fg_pct:0, ft_pct:0, to:0 }
       };
     }
-    return {
-      projections: { [seasonKey]: byId },
-      schedules: {},
-      meta: { updatedAt: Date.now() }
-    };
+    return { projections: { [seasonKey]: byId }, schedules: {}, meta: { updatedAt: Date.now() } };
   }
 
-  // -------- Draft core module --------
+  // -------- Draft core --------
   let DraftCore = null;
   (async () => {
     try { DraftCore = await import(chrome.runtime.getURL("core/draft.js")); }
@@ -121,7 +338,7 @@
     });
   }
 
-  // -------- Demo league record --------
+  // seed demo league
   chrome.runtime.sendMessage({
     type: "UPSERT_LEAGUE_SETTINGS",
     leagueId: "demo-league-1",
@@ -129,7 +346,7 @@
     settings: { scoring: "H2H", categories: ["pts","reb","ast","stl","blk","3pm","fg_pct","ft_pct","to"] }
   }, () => {});
 
-  // -------- Roster scrape & save --------
+  // -------- Roster scrape & save (with fallback) --------
   (async () => {
     try {
       if (!window.BLAdapters?.espn) return;
@@ -141,16 +358,50 @@
         if (!roster || !roster.length) return false;
         chrome.runtime.sendMessage({ type: "UPSERT_ROSTER", leagueId, roster }, (resp) => {
           if (resp?.ok) { console.log("[BL] roster saved", resp.roster); renderSidebar(leagueId, resp.roster); }
+          else { console.warn("[BL] roster save failed", resp?.error); }
         });
         return true;
       };
 
+      // Try adapter reader
       let roster = window.BLAdapters.espn.getRoster();
-      if (!saveRoster(roster)) setTimeout(() => { roster = window.BLAdapters.espn.getRoster(); saveRoster(roster); }, 1200);
+
+      // Fallback: scrape visible lineup table if adapter returns empty
+      if (!roster || !roster.length) {
+        try {
+          const table = document.querySelector(".Table, table");
+          if (table) {
+            const headerTexts = Array.from(table.querySelectorAll("thead th")).map(th => (th.textContent || "").trim().toUpperCase());
+            const playerCol = headerTexts.findIndex(h => h.includes("PLAYER"));
+            if (playerCol !== -1) {
+              const rows = Array.from(table.querySelectorAll("tbody tr"));
+              const guess = rows.map(r => {
+                const cells = r.querySelectorAll("td");
+                const playerCell = cells[playerCol];
+                const name = (playerCell?.querySelector("a")?.textContent || playerCell?.textContent || "").trim();
+                const meta = playerCell?.querySelector("span, div")?.textContent || "";
+                const posMatch = meta.match(/\b(PG|SG|SF|PF|C)(?:\/(PG|SG|SF|PF|C))*\b/);
+                const pos = posMatch ? meta.split(" ").pop().split("/") : [];
+                const teamMatch = meta.match(/\b[A-Z]{2,3}\b/);
+                const team = teamMatch ? teamMatch[0] : "";
+                return name ? { name, pos, team } : null;
+              }).filter(Boolean);
+              if (guess.length) roster = guess;
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      if (!saveRoster(roster)) {
+        setTimeout(() => {
+          roster = window.BLAdapters.espn.getRoster();
+          if (!saveRoster(roster)) renderSidebar(leagueId, []); // show empty instead of stuck "scraping…"
+        }, 1200);
+      }
     } catch (e) { console.warn("[BL] roster parse failed:", e); }
   })();
 
-  // -------- Badge --------
+  // -------- Badge UI --------
   const host = document.createElement("div");
   host.id = HOST_ID;
   host.style.position = "fixed";
@@ -187,7 +438,7 @@
   });
   shadow.appendChild(style); shadow.appendChild(wrap);
 
-  // -------- Sidebar & Draft --------
+  // -------- Sidebar & Tabs --------
   function renderSidebar(leagueId, roster) {
     const SIDEBAR_ID = "brick-layers-sidebar";
     if (document.getElementById(SIDEBAR_ID)) return;
@@ -267,11 +518,10 @@
     }
 
     function renderUpcoming() {
-      // optional schedules demo left as-is
       body.innerHTML = `<div class="sub">Upcoming schedule demo</div>`;
     }
 
-    // ---------------- Draft (ESPN pool + Live Draft) ----------------
+    // ---------------- Draft ----------------
     function renderDraft() {
       if (!DraftCore) { body.innerHTML = `<div class="sub">Loading draft engine…</div>`; setTimeout(renderDraft, 150); return; }
 
@@ -279,20 +529,26 @@
         let season = Object.keys(projections || {})[0];
         let players = (projections || {})[season] || {};
 
-        // If we don't have a real dataset yet, pull ESPN's entire player pool and cache it
         if (!season || Object.keys(players).length < 50) {
           try {
-            const { seasonId, players: pool } = await loadEspnAllPlayers();
-            const zeroProj = asZeroProjections(pool, seasonId);
-            season = seasonId;
-            players = zeroProj.projections[seasonId];
-
-            // cache in background for later loads
+            const espn = await loadEspnAllPlayers();
+            season = espn.seasonId;
+            const zeroProj = asZeroProjections(espn.players, season);
+            players = zeroProj.projections[season];
             chrome.runtime.sendMessage({ type: "UPSERT_LOADED_PLAYERS", data: zeroProj }, () => {});
           } catch (e) {
-            console.warn("[BL] ESPN player pool load failed:", e);
-            body.innerHTML = `<div class="sub">Couldn’t load ESPN player pool. Open from fantasy.espn.com while logged in.</div>`;
-            return;
+            console.warn("[BL] ESPN pool failed — using Sleeper ACTIVE fallback:", e);
+            try {
+              const sl = await loadSleeperPlayers();
+              season = sl.seasonId;
+              const zeroProj = asZeroProjections(sl.players, season);
+              players = zeroProj.projections[season];
+              chrome.runtime.sendMessage({ type: "UPSERT_LOADED_PLAYERS", data: zeroProj }, () => {});
+            } catch (e2) {
+              console.error("[BL] Sleeper fallback also failed:", e2);
+              body.innerHTML = `<div class="sub">Couldn’t load any player pool. Open from fantasy.espn.com while logged in.</div>`;
+              return;
+            }
           }
         }
 
@@ -430,22 +686,41 @@
               : DraftCore.mapRosterToProjections(savedRoster, players).matched;
 
             const weights = effectiveWeights(myPlayers);
+
             const pool = { ...players };
             for (const id of state.drafted) delete pool[id];
 
-            const top = DraftCore.bestAvailable(pool, cats, weights, {
+            let top = DraftCore.bestAvailable(pool, cats, weights, {
               pos: state.pos ? [state.pos] : [],
               ownedNames: []
-            }).slice(0, 25);
+            }).slice(0, 50);
+
+            const allZero = top.every(x => Math.abs(x.dv) < 1e-9);
+            if (allZero) {
+              const arr = Object.values(pool)
+                .filter(p => !state.pos || (p.pos || []).includes(state.pos))
+                .sort((a, b) => {
+                  const ra = (a.metaRank ?? 99999);
+                  const rb = (b.metaRank ?? 99999);
+                  if (ra !== rb) return ra - rb;
+                  return (b.metaOwned ?? 0) - (a.metaOwned ?? 0);
+                })
+                .slice(0, 25)
+                .map(p => ({ player: p, dv: (p.metaRank ? (10000 - p.metaRank) : 0) / 1000 }));
+              top = arr;
+            } else {
+              top = top.slice(0, 25);
+            }
 
             listWrap.innerHTML = `
               <ul>
                 ${top.map(item => {
                   const p = item.player;
+                  const rankBadge = (p.metaRank != null) ? `<span class="chip">#${p.metaRank}</span>` : "";
                   return `<li>
                     <span>${p.name}</span>
                     <span class="sub">${(p.team||"")} ${(p.pos||[]).join("/")}</span>
-                    <span class="num">${item.dv.toFixed(2)}</span>
+                    <span>${rankBadge}</span>
                   </li>`;
                 }).join("")}
               </ul>
@@ -458,3 +733,4 @@
     }
   }
 })();
+
