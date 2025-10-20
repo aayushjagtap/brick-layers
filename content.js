@@ -1,5 +1,5 @@
 // content.js — Sidebar + ESPN ranked player-pool + Sleeper ACTIVE fallback
-// + projections scraper (auto-paginates when you visit ESPN projections page)
+// + projections scraper (robust waiting + pagination; runs only on ESPN projections page)
 
 (() => {
   if (window.top !== window) return;
@@ -17,7 +17,7 @@
   const HOST_ID = "brick-layers-host";
   if (document.getElementById(HOST_ID)) return;
 
-  // -------- ESPN: load NBA players for CURRENT SEASON with draft ranks --------
+  // ---------------- ESPN players (ranked) ----------------
   async function loadEspnAllPlayers(seasonId) {
     if (!seasonId) {
       const q = new URLSearchParams(location.search);
@@ -63,7 +63,7 @@
       }
     };
 
-    // (A) Simple GET paging
+    // (A) Simple paging
     let offset = 0;
     try {
       while (true) {
@@ -84,7 +84,7 @@
       console.warn("[Brick Layers] ESPN simple GET failed, trying X-Fantasy-Filter:", e);
     }
 
-    // (B) Official draft-room style with X-Fantasy-Filter
+    // (B) With X-Fantasy-Filter
     const FILTER_TEMPLATE = (offset) => ({
       players: {
         filterStatus: { value: ["FREEAGENT", "ONTEAM"] },
@@ -114,7 +114,7 @@
       if (page.length < LIMIT) break;
     }
 
-    // Deduplicate best ranks
+    // Dedup best rank
     const byId = new Map();
     for (const p of all) {
       const prev = byId.get(p.id);
@@ -126,7 +126,7 @@
     return { seasonId, players };
   }
 
-  // -------- Sleeper fallback: ACTIVE players only --------
+  // ---------------- Sleeper ACTIVE fallback ----------------
   async function loadSleeperPlayers() {
     const res = await fetch("https://api.sleeper.app/v1/players/nba");
     if (!res.ok) throw new Error("Sleeper players fetch failed");
@@ -144,42 +144,48 @@
     return { seasonId: year, players: all };
   }
 
-  // -------- Projections: manual page scraper (auto-pagination) --------
+  // ---------------- Projections scraper (manual page only) ----------------
   function isEspnProjectionsPage() {
     return location.hostname.endsWith("espn.com") &&
            location.pathname.startsWith("/basketball/players/projections");
   }
 
-  // Click a button and wait a tick
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-  function normalizePct(val) {
-    // ESPN may render 47.3 or .473 — normalize to 0.473
-    const n = Number(val);
-    if (!Number.isFinite(n)) return 0;
-    return n > 1.2 ? n / 100 : n; // anything > 1 is likely percent form
-  }
-
   async function scrapeEspnProjectionsAndCache() {
-    // Wait the first tbody
-    const waitTbody = async () => {
-      const t0 = Date.now();
-      while (Date.now() - t0 < 8000) {
-        const el = document.querySelector(".Table__TBODY");
-        if (el) return el;
-        await sleep(200);
-      }
-      return null;
-    };
-    const firstTbody = await waitTbody();
-    if (!firstTbody) { console.warn("[Brick Layers] projections table not found"); return; }
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+    // Resolve seasonId
     const q = new URLSearchParams(location.search);
-    const seasonId = q.get("seasonId") || q.get("season") || String(new Date().getFullYear());
+    let seasonId = q.get("seasonId") || q.get("season");
+    if (!seasonId) seasonId = "2026"; // default for 2025-26
+    seasonId = String(seasonId);
 
-    const readHeaders = () =>
-      Array.from(document.querySelectorAll(".Table__THEAD th"))
-        .map(th => (th.textContent || "").trim().toUpperCase());
+    // Wait for the table rows to exist (robust: match any table/thead/tbody)
+    const waitRows = async (timeoutMs = 12000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const table = document.querySelector("table");
+        if (table) {
+          const tb = table.querySelector("tbody");
+          if (tb) {
+            const rows = tb.querySelectorAll("tr");
+            if (rows.length && rows[0].querySelectorAll("td").length >= 3) return true;
+          }
+        }
+        await sleep(250);
+      }
+      return false;
+    };
+
+    await waitRows(12000);
+
+    const readHeaders = () => {
+      const table = document.querySelector("table");
+      let ths = [];
+      if (table) ths = Array.from(table.querySelectorAll("thead th"));
+      if (!ths.length) ths = Array.from(document.querySelectorAll(".Table__THEAD th, thead th"));
+      const headers = ths.map(th => (th.textContent || "").trim().toUpperCase());
+      return headers;
+    };
 
     const locateCols = (headers) => {
       const colIx = (opts) => {
@@ -205,89 +211,173 @@
       };
     };
 
-    const projById = {};
-    const readPage = () => {
+    const normalizePct = (val) => {
+      const n = Number(String(val).replace(/[^\d.\-]/g,""));
+      if (!Number.isFinite(n)) return 0;
+      return n > 1.2 ? n / 100 : n;
+    };
+
+    const num = (s) => {
+      const t = String(s || "").replace(/[^\d.\-]/g, "");
+      const v = parseFloat(t);
+      return Number.isFinite(v) ? v : 0;
+    };
+
+  const projById = {};
+  const MAX_PLAYERS = 500; // cap to top N players
+    const readCurrentPage = () => {
+      // Try header/column-based read first (best-effort), but always also scan for player anchors
       const headers = readHeaders();
       const ix = locateCols(headers);
-      const num = (s) => {
-        const t = String(s || "").replace(/[^\d.\-]/g, "");
-        const v = parseFloat(t);
-        return Number.isFinite(v) ? v : 0;
-      };
-      for (const tr of Array.from(document.querySelectorAll(".Table__TBODY tr"))) {
-        const tds = tr.querySelectorAll("td");
-        if (!tds.length) continue;
-        const a = tds[ix.PLAYER]?.querySelector('a[href*="/player/"]');
-        const name = (a?.textContent || "").trim();
-        if (!name) continue;
-        const href = a?.getAttribute("href") || "";
-        const m = href.match(/\/player\/_\/id\/(\d+)\//);
-        const id = m ? m[1] : name;
+      const table = document.querySelector("table");
 
-        let team = "", pos = [];
-        const rawTP = (tds[ix.TEAMPOS]?.textContent || "").trim().replace(/\s+/g," ");
-        if (rawTP) {
-          const parts = rawTP.split(" ");
-          const maybePos = parts[parts.length - 1];
-          if (/[A-Z]{1,3}(?:\/[A-Z]{1,3})*/.test(maybePos)) {
-            team = parts.slice(0, -1).join(" ");
-            pos = maybePos.split("/");
-          } else {
-            team = rawTP;
+      // (A) Column-aware pass: pick rows that match expected columns
+      if (table) {
+        const rows = Array.from(table.querySelectorAll("tbody tr"));
+        rows.forEach(tr => {
+          const tds = tr.querySelectorAll("td");
+          if (!tds.length) return;
+          if (ix.PLAYER == null || ix.PLAYER < 0 || ix.PLAYER >= tds.length) return;
+          const playerCell = tds[ix.PLAYER];
+          let a = playerCell?.querySelector('a[href*="/player/"], a[href*="/players/"]') || playerCell?.querySelector('a');
+          const name = (a?.textContent || playerCell?.textContent || "").trim();
+          if (!name) return;
+          const href = a?.getAttribute("href") || "";
+          let id = name;
+          const patterns = [/\/player\/.*?\/id\/(\d+)/, /playerId=(\d+)/, /\/(?:player|players)\/(\d+)\b/, /(\d{3,7})/];
+          for (const p of patterns) {
+            const m = href.match(p);
+            if (m && m[1]) { id = m[1]; break; }
           }
+          const rawTP = (tds[ix.TEAMPOS]?.textContent || "").trim().replace(/\s+/g, " ");
+          let team = "", pos = [];
+          if (rawTP) {
+            const parts = rawTP.split(" ");
+            const maybePos = parts[parts.length - 1];
+            if (/[A-Z]{1,3}(?:\/[A-Z]{1,3})*/.test(maybePos)) {
+              team = parts.slice(0, -1).join(" "); pos = maybePos.split("/");
+            } else { team = rawTP; }
+          }
+          const cats = {
+            pts:   num(tds[ix.PTS]?.textContent),
+            reb:   num(tds[ix.REB]?.textContent),
+            ast:   num(tds[ix.AST]?.textContent),
+            stl:   num(tds[ix.STL]?.textContent),
+            blk:   num(tds[ix.BLK]?.textContent),
+            "3pm": num(tds[ix.TPM]?.textContent),
+            fg_pct: normalizePct(tds[ix.FG]?.textContent),
+            ft_pct: normalizePct(tds[ix.FT]?.textContent),
+            to:    num(tds[ix.TO]?.textContent)
+          };
+          projById[id] = { id, name, team, pos, cats, metaRank: null, metaOwned: 0 };
+        });
+      }
+
+      // (B) Anchor scan fallback: collect any player anchors in tbody to ensure we capture all listed players
+      const anchorSelector = 'tbody a[href*="/player/"], tbody a[href*="/players/"], tbody a';
+      const anchors = table ? Array.from(table.querySelectorAll(anchorSelector)) : Array.from(document.querySelectorAll(anchorSelector));
+      for (const a of anchors) {
+        const name = (a.textContent || "").trim();
+        if (!name) continue;
+        const href = a.getAttribute("href") || "";
+        let id = name;
+        const patterns = [/\/player\/.*?\/id\/(\d+)/, /playerId=(\d+)/, /\/(?:player|players)\/(\d+)\b/, /(\d{3,7})/];
+        for (const p of patterns) {
+          const m = href.match(p);
+          if (m && m[1]) { id = m[1]; break; }
         }
-
-        const cats = {
-          pts:   num(tds[ix.PTS]?.textContent),
-          reb:   num(tds[ix.REB]?.textContent),
-          ast:   num(tds[ix.AST]?.textContent),
-          stl:   num(tds[ix.STL]?.textContent),
-          blk:   num(tds[ix.BLK]?.textContent),
-          "3pm": num(tds[ix.TPM]?.textContent),
-          fg_pct: normalizePct(num(tds[ix.FG]?.textContent)),
-          ft_pct: normalizePct(num(tds[ix.FT]?.textContent)),
-          to:    num(tds[ix.TO]?.textContent)
-        };
-
-        projById[id] = { id, name, team, pos, cats, metaRank: null, metaOwned: 0 };
+        if (!projById[id]) {
+          projById[id] = { id, name, team: "", pos: [], cats: { pts:0, reb:0, ast:0, stl:0, blk:0, "3pm":0, fg_pct:0, ft_pct:0, to:0 }, metaRank: null, metaOwned: 0 };
+        }
       }
     };
 
-    // Scrape first page
-    readPage();
+    // Helper: wait until the number of player anchors in the table increases (used after clicking Next)
+    const waitForNewAnchors = async (prevCount, timeoutMs = 4000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const table = document.querySelector("table");
+        const anchors = table ? table.querySelectorAll('tbody a[href*="/player/"], tbody a[href*="/players/"], tbody a') : document.querySelectorAll('tbody a');
+        if (anchors.length > prevCount) return true;
+        await sleep(200);
+      }
+      return false;
+    };
 
-    // Keep clicking "Next" (or ">" button) until disabled/not present
-    // ESPN usually uses buttons with aria-labels or visible text like "Next"
-    const isDisabled = (btn) => btn.disabled || btn.getAttribute("aria-disabled") === "true";
+    // First read
+    readCurrentPage();
+    console.debug && console.debug("[BL] projections: after first read, players=", Object.keys(projById).length);
+    if (Object.keys(projById).length === 0) {
+      await sleep(1500);
+      await waitRows(6000);
+      readCurrentPage();
+    }
+
+    // Paginate (click "Next") until end or until we have MAX_PLAYERS
+    const isDisabled = (btn) => btn?.disabled || btn?.getAttribute("aria-disabled") === "true";
     const findNextBtn = () =>
       document.querySelector('button[aria-label*="Next"], button[aria-label*="next"], .Pagination__Button--next');
 
-    // Try up to 2000 players safety
-    let pageGuard = 0;
-    while (pageGuard < 60) {
-      pageGuard++;
-      const nextBtn = findNextBtn();
-      if (!nextBtn || isDisabled(nextBtn)) break;
-      nextBtn.click();
-      // wait page swap
-      await sleep(500);
-      readPage();
-      // tiny yield to allow virtualized rows
-      await sleep(150);
+    let safety = 0;
+    while (safety++ < 80) {
+      // Stop if we've already collected enough unique players
+      if (Object.keys(projById).length >= MAX_PLAYERS) break;
+      const next = findNextBtn();
+      if (!next || isDisabled(next)) break;
+      // determine current anchors count and click
+      const table = document.querySelector("table");
+      const prevAnchors = table ? table.querySelectorAll('tbody a').length : document.querySelectorAll('tbody a').length;
+      console.debug && console.debug(`[BL] projections: before click, prevAnchors=${prevAnchors}, players=${Object.keys(projById).length}`);
+      try { next.scrollIntoView({ block: "center", behavior: "auto" }); } catch (e) {}
+      next.click();
+      // wait for new anchors to appear (pagination updated)
+      await waitForNewAnchors(prevAnchors, 3000);
+      // fallback additional wait and row check
+      await sleep(300);
+      await waitRows(2000);
+      readCurrentPage();
+      const anchorsAfter = table ? table.querySelectorAll('tbody a').length : document.querySelectorAll('tbody a').length;
+      console.debug && console.debug(`[BL] projections: after page read, anchorsAfter=${anchorsAfter}, players=${Object.keys(projById).length}`);
+      // defensive stop if we've hit the cap
+      if (Object.keys(projById).length >= MAX_PLAYERS) break;
     }
 
-    const count = Object.keys(projById).length;
-    const pack = { projections: { [seasonId]: projById }, schedules: {}, meta: { updatedAt: Date.now() } };
+  // If we ended up with unexpectedly few players, try a full-page anchor scan as fallback
+  if (Object.keys(projById).length < Math.min(50, MAX_PLAYERS)) {
+    console.debug && console.debug("[BL] projections: performing full-page anchor fallback scan");
+    const allAnchors = Array.from(document.querySelectorAll('a[href*="/player/"], a[href*="/players/"]'));
+    for (const a of allAnchors) {
+      const name = (a.textContent || "").trim();
+      if (!name) continue;
+      const href = a.getAttribute("href") || "";
+      let id = name;
+      const patterns = [/\/player\/.*?\/id\/(\d+)/, /playerId=(\d+)/, /\/(?:player|players)\/(\d+)\b/, /(\d{3,7})/];
+      for (const p of patterns) {
+        const m = href.match(p);
+        if (m && m[1]) { id = m[1]; break; }
+      }
+      if (!projById[id]) {
+        projById[id] = { id, name, team: "", pos: [], cats: { pts:0, reb:0, ast:0, stl:0, blk:0, "3pm":0, fg_pct:0, ft_pct:0, to:0 }, metaRank: null, metaOwned: 0 };
+      }
+    }
+    console.debug && console.debug("[BL] projections: after full-page scan, players=", Object.keys(projById).length);
+  }
+
+  // Trim to MAX_PLAYERS if necessary (keep insertion order)
+  const ids = Object.keys(projById).slice(0, MAX_PLAYERS);
+  const trimmed = {};
+  for (const id of ids) trimmed[id] = projById[id];
+  const count = Object.keys(trimmed).length;
+  const pack = { projections: { [seasonId]: trimmed }, schedules: {}, meta: { updatedAt: Date.now() } };
     await new Promise(r => chrome.runtime.sendMessage({ type: "UPSERT_LOADED_PLAYERS", data: pack }, () => r()));
     console.log(`[Brick Layers] scraped ESPN projections: ${count} players for ${seasonId}`);
   }
 
-  // Run scraper only when you open the ESPN projections page manually
   if (isEspnProjectionsPage()) {
     scrapeEspnProjectionsAndCache().catch(e => console.warn("[Brick Layers] projections scrape failed:", e));
   }
 
-  // -------- Convert pool → zero projections (keeps ESPN rank for fallback sort) --------
+  // ---------------- convert player pool → zero projections (rank fallback) ----------------
   function asZeroProjections(players, seasonKey) {
     const byId = {};
     for (const p of players) {
@@ -304,14 +394,14 @@
     return { projections: { [seasonKey]: byId }, schedules: {}, meta: { updatedAt: Date.now() } };
   }
 
-  // -------- Draft core --------
+  // ---------------- Draft core module ----------------
   let DraftCore = null;
   (async () => {
     try { DraftCore = await import(chrome.runtime.getURL("core/draft.js")); }
     catch (e) { console.warn("[BL] draft import failed:", e); }
   })();
 
-  // -------- ESPN context -> save --------
+  // ---------------- ESPN context save ----------------
   (async () => {
     try {
       if (window.BLAdapters?.espn) {
@@ -327,7 +417,7 @@
     } catch (e) { console.warn("[BL] ESPN detect failed:", e); }
   })();
 
-  // -------- Data cache --------
+  // ---------------- data cache ----------------
   let _dataCache = null;
   function getData(cb) {
     if (_dataCache) return cb(_dataCache);
@@ -346,7 +436,7 @@
     settings: { scoring: "H2H", categories: ["pts","reb","ast","stl","blk","3pm","fg_pct","ft_pct","to"] }
   }, () => {});
 
-  // -------- Roster scrape & save (with fallback) --------
+  // ---------------- roster scrape & save (with fallback) ----------------
   (async () => {
     try {
       if (!window.BLAdapters?.espn) return;
@@ -366,7 +456,7 @@
       // Try adapter reader
       let roster = window.BLAdapters.espn.getRoster();
 
-      // Fallback: scrape visible lineup table if adapter returns empty
+      // Fallback scrape if adapter returns empty
       if (!roster || !roster.length) {
         try {
           const table = document.querySelector(".Table, table");
@@ -395,13 +485,13 @@
       if (!saveRoster(roster)) {
         setTimeout(() => {
           roster = window.BLAdapters.espn.getRoster();
-          if (!saveRoster(roster)) renderSidebar(leagueId, []); // show empty instead of stuck "scraping…"
+          if (!saveRoster(roster)) renderSidebar(leagueId, []); // show empty instead of stuck
         }, 1200);
       }
     } catch (e) { console.warn("[BL] roster parse failed:", e); }
   })();
 
-  // -------- Badge UI --------
+  // ---------------- badge ----------------
   const host = document.createElement("div");
   host.id = HOST_ID;
   host.style.position = "fixed";
@@ -438,7 +528,7 @@
   });
   shadow.appendChild(style); shadow.appendChild(wrap);
 
-  // -------- Sidebar & Tabs --------
+  // ---------------- sidebar & tabs ----------------
   function renderSidebar(leagueId, roster) {
     const SIDEBAR_ID = "brick-layers-sidebar";
     if (document.getElementById(SIDEBAR_ID)) return;
@@ -666,6 +756,7 @@
           }
 
           function effectiveWeights(myPlayers) {
+            const cats = ["pts","reb","ast","stl","blk","3pm","fg_pct","ft_pct","to"];
             let needs = Object.fromEntries(cats.map(c => [c, 1]));
             if (state.useNeeds) {
               const source = (state.liveDraft ? myPlayers : null) ||
@@ -685,6 +776,7 @@
               ? state.myPicks.map(id => players[id]).filter(Boolean)
               : DraftCore.mapRosterToProjections(savedRoster, players).matched;
 
+            const cats = ["pts","reb","ast","stl","blk","3pm","fg_pct","ft_pct","to"];
             const weights = effectiveWeights(myPlayers);
 
             const pool = { ...players };
@@ -733,4 +825,3 @@
     }
   }
 })();
-
